@@ -164,24 +164,28 @@ class BTCUpDownArbBot {
                     this.tradingMarkets.add(market.id);
                     // EXECUTE REAL TRADE
                     const trade = await executeTrade(arb);
-                    // CRITICAL: Mark as executed ONLY if orders were actually placed
-                    // This ensures we only trade each market ONCE ($5 exposure rule)
-                    // If orders failed to place (null trade or no order IDs), don't mark as executed
-                    if (trade && trade.up_order_id && trade.down_order_id) {
-                        // Orders were placed - mark as executed to prevent retries
-                        this.executedMarkets.add(market.id);
-                        log(`✅ Orders placed - Market marked as executed (maintains $5 exposure rule)`);
+                    // CRITICAL: Only mark as executed if trade SUCCEEDED (both legs filled)
+                    // If trade failed, don't mark as executed - we can retry
+                    if (trade) {
                         if (trade.status === 'filled') {
-                            log(`   ✅ Both legs completed successfully`);
+                            // Trade succeeded - mark as executed (maintains $5 exposure rule)
+                            this.executedMarkets.add(market.id);
+                            log(`✅ Trade SUCCESS - Both legs completed - Market marked as executed`);
+                        }
+                        else if (trade.up_order_id && trade.down_order_id) {
+                            // Orders were placed but trade failed - DON'T mark as executed
+                            // This allows retry if arb persists (orders might have been cancelled/reversed)
+                            log(`⚠️ Trade ${trade.status}: ${trade.error || 'Unknown error'}`);
+                            log(`   Orders were placed but didn't complete - Will retry if arb persists`);
                         }
                         else {
-                            log(`   ⚠️ Trade status: ${trade.status} - Position monitoring in progress`);
+                            // Orders were NOT placed - can retry
+                            log(`⚠️ Orders not placed - Can retry if arb persists`);
                         }
                     }
                     else {
-                        // Orders were NOT placed (rejected before submission or submission failed)
-                        // Don't mark as executed - can try again if arb persists
-                        log(`⚠️ Orders not placed - Can retry if arb persists`);
+                        // Trade was null (rejected before execution)
+                        log(`⚠️ Trade rejected before execution - Can retry if arb persists`);
                     }
                     // Remove from trading set (done processing this attempt)
                     this.tradingMarkets.delete(market.id);

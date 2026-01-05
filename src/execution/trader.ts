@@ -490,6 +490,8 @@ async function waitForBothOrders(
 
   // IMMEDIATE first check (no delay) - racing other bots
   let positions = await checkPositions(upTokenId, downTokenId, shares);
+  console.log(`   [0ms] Position check: UP=${positions.upBalance.toFixed(1)} DOWN=${positions.downBalance.toFixed(1)}`);
+  
   if (positions.hasUp && positions.hasDown) {
     // Both filled - cancel pending orders in parallel (fast)
     await Promise.all([
@@ -519,6 +521,7 @@ async function waitForBothOrders(
       
       // BOTH POSITIONS - SUCCESS! (cancel in parallel for speed)
       if (positions.hasUp && positions.hasDown) {
+        console.log(`   [${elapsed}ms] ✅ BOTH POSITIONS - SUCCESS!`);
         await Promise.all([
           cancelOrder(upOrderId),
           cancelOrder(downOrderId),
@@ -544,9 +547,12 @@ async function waitForBothOrders(
   const finalPositions = await checkPositions(upTokenId, downTokenId, shares);
   const hasUp = finalPositions.hasUp;
   const hasDown = finalPositions.hasDown;
+  
+  console.log(`   [TIMEOUT] Final positions: UP=${finalPositions.upBalance.toFixed(1)} (${hasUp ? 'YES' : 'NO'}) DOWN=${finalPositions.downBalance.toFixed(1)} (${hasDown ? 'YES' : 'NO'})`);
 
   // BOTH - Success (cancel in parallel)
   if (hasUp && hasDown) {
+    console.log(`   ✅ BOTH POSITIONS at timeout - SUCCESS!`);
     await Promise.all([
       cancelOrder(upOrderId),
       cancelOrder(downOrderId),
@@ -555,7 +561,8 @@ async function waitForBothOrders(
     return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
   }
 
-  // ONE-SIDED OR NONE - REVERSE IMMEDIATELY (cancel and reverse in parallel where possible)
+  // ONE-SIDED OR NONE - REVERSE IMMEDIATELY
+  console.log(`   ❌ Don't have both - reversing any filled leg...`);
   await Promise.all([
     cancelOrder(upOrderId),
     cancelOrder(downOrderId),
@@ -565,9 +572,19 @@ async function waitForBothOrders(
   // Reverse any filled leg (fast)
   let reversed = false;
   if (hasUp && !hasDown) {
+    console.log(`   🔄 Reversing ${finalPositions.upBalance.toFixed(0)} UP shares...`);
     reversed = await reversePosition(upTokenId, Math.floor(finalPositions.upBalance));
   } else if (!hasUp && hasDown) {
+    console.log(`   🔄 Reversing ${finalPositions.downBalance.toFixed(0)} DOWN shares...`);
     reversed = await reversePosition(downTokenId, Math.floor(finalPositions.downBalance));
+  } else {
+    console.log(`   ℹ️ No positions to reverse - orders likely didn't fill`);
+  }
+  
+  if (reversed) {
+    console.log(`   ✅ Reversal successful`);
+  } else if (hasUp || hasDown) {
+    console.log(`   ⚠️ Reversal may have failed - check manually`);
   }
 
   return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
@@ -749,12 +766,16 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     } else {
       // Don't have both - trade failed (waitForBothOrders already reversed if needed)
       trade.status = 'failed';
+      const posInfo = `UP=${finalCheck.upBalance.toFixed(1)} DOWN=${finalCheck.downBalance.toFixed(1)}`;
       if (reversed) {
         trade.error = 'Reversed one-sided position - no exposure';
-        console.log(`   ✅ Trade failed but position reversed - no exposure`);
+        console.log(`   ✅ Trade failed but position reversed - no exposure (${posInfo})`);
+      } else if (finalCheck.hasUp || finalCheck.hasDown) {
+        trade.error = `One-sided position detected but reversal failed (${posInfo})`;
+        console.log(`   ⚠️ Trade failed - one-sided position but reversal failed (${posInfo})`);
       } else {
-        trade.error = 'Could not complete both legs';
-        console.log(`   ❌ Trade failed - no positions or reversal failed`);
+        trade.error = 'Could not complete both legs - no positions detected';
+        console.log(`   ❌ Trade failed - no positions detected (${posInfo})`);
       }
       console.log(`   📊 Continuing to scan for more opportunities...\n`);
     }
