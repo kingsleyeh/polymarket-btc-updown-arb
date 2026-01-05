@@ -400,35 +400,50 @@ async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId,
     let secondLegOrderId = null;
     let marketOrderPlaced = false;
     let lastPositionCheck = 0;
-    // IMMEDIATE first check (no delay) - racing other bots
+    // IMMEDIATE first check: Check ORDER STATUS (fast)
+    const [upStatus, downStatus] = await Promise.all([
+        checkOrderStatus(upOrderId),
+        checkOrderStatus(downOrderId),
+    ]);
+    // Treat 'filled' or 'unknown' (404 = order removed, likely filled) as potentially filled
+    let upFilled = upStatus === 'filled' || upStatus === 'unknown';
+    let downFilled = downStatus === 'filled' || downStatus === 'unknown';
+    // Verify with positions (positions are the source of truth)
     let positions = await checkPositions(upTokenId, downTokenId, shares);
-    console.log(`   [0ms] Position check: UP=${positions.upBalance.toFixed(1)} DOWN=${positions.downBalance.toFixed(1)}`);
-    if (positions.hasUp && positions.hasDown) {
-        // Both filled - cancel pending orders in parallel (fast)
+    let hasUpPos = positions.hasUp;
+    let hasDownPos = positions.hasDown;
+    console.log(`   [0ms] Order status: UP=${upStatus} DOWN=${downStatus} | Positions: UP=${positions.upBalance.toFixed(1)} DOWN=${positions.downBalance.toFixed(1)}`);
+    // BOTH FILLED - SUCCESS!
+    if (hasUpPos && hasDownPos) {
+        console.log(`   ✅ BOTH FILLED immediately!`);
         await Promise.all([
             cancelOrder(upOrderId),
             cancelOrder(downOrderId),
         ]);
         return { upFilled: true, downFilled: true, secondLegOrderId: null, reversed: false };
     }
-    // If one filled, place market order IMMEDIATELY (no waiting, no logging)
-    if (positions.hasUp && !positions.hasDown && !marketOrderPlaced) {
+    // ONE-SIDED: Place market order IMMEDIATELY
+    if (hasUpPos && !hasDownPos && !marketOrderPlaced) {
+        console.log(`   ⚠️ UP filled but DOWN didn't - placing MARKET order for DOWN NOW...`);
         marketOrderPlaced = true;
         secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
     }
-    else if (!positions.hasUp && positions.hasDown && !marketOrderPlaced) {
+    else if (!hasUpPos && hasDownPos && !marketOrderPlaced) {
+        console.log(`   ⚠️ DOWN filled but UP didn't - placing MARKET order for UP NOW...`);
         marketOrderPlaced = true;
         secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
     }
-    // Fast polling loop: check positions every 100ms, max 500ms
+    // Fast polling loop: check POSITIONS every 100ms (positions are source of truth)
     while (Date.now() - startTime < MAX_WAIT_FOR_BOTH_MS) {
         const elapsed = Date.now() - startTime;
-        // Check positions every 100ms
+        // Check POSITIONS (source of truth - faster than order status API)
         if (Date.now() - lastPositionCheck >= POSITION_CHECK_INTERVAL_MS) {
             lastPositionCheck = Date.now();
             positions = await checkPositions(upTokenId, downTokenId, shares);
-            // BOTH POSITIONS - SUCCESS! (cancel in parallel for speed)
-            if (positions.hasUp && positions.hasDown) {
+            hasUpPos = positions.hasUp;
+            hasDownPos = positions.hasDown;
+            // BOTH FILLED - SUCCESS!
+            if (hasUpPos && hasDownPos) {
                 console.log(`   [${elapsed}ms] ✅ BOTH POSITIONS - SUCCESS!`);
                 await Promise.all([
                     cancelOrder(upOrderId),
@@ -437,25 +452,27 @@ async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId,
                 ]);
                 return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
             }
-            // ONE-SIDED: Place market order if not already placed (no logging for speed)
-            if (positions.hasUp && !positions.hasDown && !marketOrderPlaced) {
+            // ONE-SIDED: Place market order if not already placed
+            if (hasUpPos && !hasDownPos && !marketOrderPlaced) {
+                console.log(`   [${elapsed}ms] ⚠️ UP filled - placing MARKET order for DOWN...`);
                 marketOrderPlaced = true;
                 secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
             }
-            else if (!positions.hasUp && positions.hasDown && !marketOrderPlaced) {
+            else if (!hasUpPos && hasDownPos && !marketOrderPlaced) {
+                console.log(`   [${elapsed}ms] ⚠️ DOWN filled - placing MARKET order for UP...`);
                 marketOrderPlaced = true;
                 secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
             }
         }
-        await new Promise(r => setTimeout(r, 25)); // Ultra-fast polling (25ms)
+        await new Promise(r => setTimeout(r, 50)); // Poll every 50ms
     }
-    // TIMEOUT: Check final positions (fast)
+    // TIMEOUT: Final check - POSITIONS are source of truth
     const finalPositions = await checkPositions(upTokenId, downTokenId, shares);
-    const hasUp = finalPositions.hasUp;
-    const hasDown = finalPositions.hasDown;
-    console.log(`   [TIMEOUT] Final positions: UP=${finalPositions.upBalance.toFixed(1)} (${hasUp ? 'YES' : 'NO'}) DOWN=${finalPositions.downBalance.toFixed(1)} (${hasDown ? 'YES' : 'NO'})`);
-    // BOTH - Success (cancel in parallel)
-    if (hasUp && hasDown) {
+    const finalHasUp = finalPositions.hasUp;
+    const finalHasDown = finalPositions.hasDown;
+    console.log(`   [TIMEOUT] Final positions: UP=${finalPositions.upBalance.toFixed(1)} (${finalHasUp ? 'YES' : 'NO'}) DOWN=${finalPositions.downBalance.toFixed(1)} (${finalHasDown ? 'YES' : 'NO'})`);
+    // BOTH - Success
+    if (finalHasUp && finalHasDown) {
         console.log(`   ✅ BOTH POSITIONS at timeout - SUCCESS!`);
         await Promise.all([
             cancelOrder(upOrderId),
@@ -471,23 +488,25 @@ async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId,
         cancelOrder(downOrderId),
         secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
     ]);
-    // Reverse any filled leg (fast)
+    // Reverse any filled leg - use actual balance from positions
     let reversed = false;
-    if (hasUp && !hasDown) {
-        console.log(`   🔄 Reversing ${finalPositions.upBalance.toFixed(0)} UP shares...`);
-        reversed = await reversePosition(upTokenId, Math.floor(finalPositions.upBalance));
+    if (finalHasUp && !finalHasDown) {
+        const sharesToReverse = Math.max(Math.floor(finalPositions.upBalance), shares);
+        console.log(`   🔄 Reversing ${sharesToReverse} UP shares...`);
+        reversed = await reversePosition(upTokenId, sharesToReverse);
     }
-    else if (!hasUp && hasDown) {
-        console.log(`   🔄 Reversing ${finalPositions.downBalance.toFixed(0)} DOWN shares...`);
-        reversed = await reversePosition(downTokenId, Math.floor(finalPositions.downBalance));
+    else if (!finalHasUp && finalHasDown) {
+        const sharesToReverse = Math.max(Math.floor(finalPositions.downBalance), shares);
+        console.log(`   🔄 Reversing ${sharesToReverse} DOWN shares...`);
+        reversed = await reversePosition(downTokenId, sharesToReverse);
     }
     else {
-        console.log(`   ℹ️ No positions to reverse - orders likely didn't fill`);
+        console.log(`   ℹ️ No positions to reverse - orders didn't fill`);
     }
     if (reversed) {
         console.log(`   ✅ Reversal successful`);
     }
-    else if (hasUp || hasDown) {
+    else if (finalHasUp || finalHasDown) {
         console.log(`   ⚠️ Reversal may have failed - check manually`);
     }
     return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
@@ -543,46 +562,13 @@ export async function executeTrade(arb) {
     };
     console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
     console.log(`   Cost: $${costUsd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
-    console.log(`   Fetching FRESH prices for TRUE MARKET ORDERS...`);
-    // Get FRESH prices RIGHT NOW (prices from scan may be stale)
-    const [freshUpResp, freshDownResp] = await Promise.all([
-        axios.get(`${CLOB_HOST}/price`, { params: { token_id: arb.up_token_id, side: 'buy' }, timeout: 200 }),
-        axios.get(`${CLOB_HOST}/price`, { params: { token_id: arb.down_token_id, side: 'buy' }, timeout: 200 }),
-    ]);
-    const freshUpPrice = parseFloat(freshUpResp.data?.price || '0');
-    const freshDownPrice = parseFloat(freshDownResp.data?.price || '0');
-    if (freshUpPrice === 0 || freshDownPrice === 0) {
-        console.log(`   ❌ Failed to get fresh prices - rejecting`);
-        return null;
-    }
-    const freshCombined = freshUpPrice + freshDownPrice;
-    // If fresh prices already exceed our limit, arb is gone
-    if (freshCombined >= MAX_COMBINED_COST) {
-        console.log(`   ❌ Fresh prices already at $${freshCombined.toFixed(4)} - arb disappeared`);
-        return null;
-    }
-    // Calculate market prices with smart buffer
-    // If fresh prices are already high, use smaller buffer to ensure we stay under $0.99
-    const roomForBuffer = MAX_COMBINED_COST - freshCombined;
-    let upMarketPrice;
-    let downMarketPrice;
-    if (roomForBuffer > 0.05) {
-        // Plenty of room - use 5% buffer per leg for aggressive fills
-        upMarketPrice = Math.min(freshUpPrice * 1.05, 0.99);
-        downMarketPrice = Math.min(freshDownPrice * 1.05, 0.99);
-    }
-    else if (roomForBuffer > 0.02) {
-        // Some room - use 2% buffer per leg
-        upMarketPrice = Math.min(freshUpPrice * 1.02, 0.99);
-        downMarketPrice = Math.min(freshDownPrice * 1.02, 0.99);
-    }
-    else {
-        // Very little room - use fresh prices directly (should still fill if liquidity exists)
-        upMarketPrice = freshUpPrice;
-        downMarketPrice = freshDownPrice;
-    }
+    // Use scan prices directly (they're already from /price endpoint = execution prices)
+    // Add small 3% buffer to ensure immediate fills - keep it simple like it was working
+    const SIMPLE_BUFFER = 0.03; // 3% - enough to fill, not too aggressive
+    let upMarketPrice = Math.min(upPrice * (1 + SIMPLE_BUFFER), 0.99);
+    let downMarketPrice = Math.min(downPrice * (1 + SIMPLE_BUFFER), 0.99);
     let maxCombinedCost = upMarketPrice + downMarketPrice;
-    // If still exceeds, scale down proportionally
+    // If exceeds limit, scale down proportionally
     if (maxCombinedCost > MAX_COMBINED_COST) {
         const scaleFactor = MAX_COMBINED_COST / maxCombinedCost;
         upMarketPrice = upMarketPrice * scaleFactor;
@@ -594,7 +580,6 @@ export async function executeTrade(arb) {
         console.log(`   ❌ Max combined cost $${maxCombinedCost.toFixed(4)} exceeds limit $${MAX_COMBINED_COST.toFixed(2)} - rejecting`);
         return null;
     }
-    console.log(`   Fresh prices: UP=$${freshUpPrice.toFixed(3)} DOWN=$${freshDownPrice.toFixed(3)} = $${(freshUpPrice + freshDownPrice).toFixed(4)}`);
     console.log(`   Market orders: UP=$${upMarketPrice.toFixed(3)} DOWN=$${downMarketPrice.toFixed(3)} = $${maxCombinedCost.toFixed(4)}`);
     try {
         // Place BOTH orders simultaneously with TRUE MARKET prices (20% buffer)
