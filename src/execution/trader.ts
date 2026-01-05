@@ -16,7 +16,6 @@ import { ArbitrageOpportunity } from '../types/arbitrage';
 
 // ============ CONFIGURATION ============
 const TRADE_SIZE_PERCENT = 0.10; // 10% of available balance per trade
-const MIN_TRADE_SIZE_USD = 5; // Minimum $5 per trade (to meet Polymarket's 5 share minimum)
 const MIN_SHARES = 5; // Polymarket requires minimum 5 shares per order
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
@@ -100,7 +99,7 @@ export async function initializeTrader(): Promise<boolean> {
     
     console.log(`\n📊 SIZING CONFIG:`);
     console.log(`   Trade size: ${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of balance`);
-    console.log(`   Min per trade: $${MIN_TRADE_SIZE_USD}`);
+    console.log(`   Minimum shares: ${MIN_SHARES} (Polymarket requirement)`);
     console.log(`   Max liquidity take: ${(MAX_LIQUIDITY_PERCENT * 100).toFixed(0)}%`);
     console.log(`   Market order slippage: ${(MARKET_ORDER_SLIPPAGE * 100).toFixed(1)}%`);
 
@@ -242,11 +241,6 @@ function calculateTradeSize(
   let targetUsd = balance * TRADE_SIZE_PERCENT;
   let reason = `${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of $${balance.toFixed(2)} balance`;
 
-  // Floor at min USD
-  if (targetUsd < MIN_TRADE_SIZE_USD) {
-    return { shares: 0, reason: `below min $${MIN_TRADE_SIZE_USD}` };
-  }
-
   // Calculate shares from USD
   let shares = Math.floor(targetUsd / combinedCost);
   
@@ -255,9 +249,11 @@ function calculateTradeSize(
     // Check if we can afford minimum 5 shares
     const minCost = MIN_SHARES * combinedCost;
     if (minCost > balance) {
-      return { shares: 0, reason: `cannot afford minimum ${MIN_SHARES} shares (need $${minCost.toFixed(2)})` };
+      return { shares: 0, reason: `cannot afford minimum ${MIN_SHARES} shares (need $${minCost.toFixed(2)}, have $${balance.toFixed(2)})` };
     }
+    // Use minimum 5 shares if we can afford it
     shares = MIN_SHARES;
+    reason = `minimum ${MIN_SHARES} shares (can afford $${minCost.toFixed(2)} of $${balance.toFixed(2)} balance)`;
   }
 
   // Respect liquidity - don't take more than MAX_LIQUIDITY_PERCENT of available
@@ -265,14 +261,18 @@ function calculateTradeSize(
   const maxDownShares = Math.floor(downLiquidity * MAX_LIQUIDITY_PERCENT);
   const liquidityLimit = Math.min(maxUpShares, maxDownShares);
 
-  if (shares > liquidityLimit && liquidityLimit > 0) {
+  if (shares > liquidityLimit && liquidityLimit >= MIN_SHARES) {
+    // Only limit if liquidity allows at least minimum shares
     shares = liquidityLimit;
     reason = `limited by liquidity (${(MAX_LIQUIDITY_PERCENT * 100).toFixed(0)}% of ${Math.min(upLiquidity, downLiquidity).toFixed(0)} available)`;
+  } else if (shares > liquidityLimit && liquidityLimit < MIN_SHARES) {
+    // Liquidity is too low - can't meet minimum
+    return { shares: 0, reason: `insufficient liquidity (need ${MIN_SHARES} shares, only ${liquidityLimit.toFixed(0)} available)` };
   }
 
-  // Final check
-  if (shares < 1) {
-    return { shares: 0, reason: 'insufficient liquidity' };
+  // Final check - must have at least minimum shares
+  if (shares < MIN_SHARES) {
+    return { shares: 0, reason: `below minimum ${MIN_SHARES} shares` };
   }
 
   return { shares, reason };
