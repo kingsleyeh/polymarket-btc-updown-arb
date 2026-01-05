@@ -334,34 +334,59 @@ async function checkPositions(upTokenId, downTokenId, expectedShares) {
 async function reversePosition(tokenId, shares) {
     if (!clobClient)
         return false;
-    try {
-        // Get current price to sell at market (fast timeout)
-        const priceResp = await axios.get(`${CLOB_HOST}/price`, {
-            params: { token_id: tokenId, side: 'sell' },
-            timeout: 300, // Fast - racing other bots
-        });
-        const sellPrice = parseFloat(priceResp.data?.price || '0');
-        if (sellPrice === 0)
+    // Retry up to 3 times
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            // Get current price to sell at market (fast timeout)
+            const priceResp = await axios.get(`${CLOB_HOST}/price`, {
+                params: { token_id: tokenId, side: 'sell' },
+                timeout: 300,
+            });
+            const sellPrice = parseFloat(priceResp.data?.price || '0');
+            if (sellPrice === 0) {
+                if (attempt < 3)
+                    continue;
+                return false;
+            }
+            // Use VERY aggressive limit (5% below market) to ensure immediate fill
+            const limitPrice = Math.max(sellPrice * 0.95, 0.01); // 5% below market for speed
+            if (attempt === 1) {
+                console.log(`   🔄 Reversing: selling ${shares} shares @ $${limitPrice.toFixed(3)} (attempt ${attempt})...`);
+            }
+            const order = await clobClient.createAndPostOrder({
+                tokenID: tokenId,
+                price: limitPrice,
+                size: shares,
+                side: Side.SELL,
+            });
+            if (order.orderID) {
+                console.log(`   ✓ Reversal order placed: ${order.orderID}`);
+                // Wait 200ms and verify it filled
+                await new Promise(r => setTimeout(r, 200));
+                const orderStatus = await checkOrderStatus(order.orderID);
+                if (orderStatus === 'filled') {
+                    return true;
+                }
+                else if (attempt < 3) {
+                    console.log(`   ⚠️ Reversal order not filled yet, retrying...`);
+                    continue;
+                }
+                return true; // Order placed, even if not confirmed filled
+            }
+            if (attempt < 3)
+                continue;
             return false;
-        // Use aggressive limit (slightly below market) to ensure immediate fill
-        const limitPrice = Math.max(sellPrice * 0.98, 0.01); // 2% below market, min $0.01
-        console.log(`   🔄 Reversing position: selling ${shares} shares @ $${limitPrice.toFixed(3)}...`);
-        const order = await clobClient.createAndPostOrder({
-            tokenID: tokenId,
-            price: limitPrice,
-            size: shares,
-            side: Side.SELL,
-        });
-        if (order.orderID) {
-            console.log(`   ✓ Reversal order placed: ${order.orderID}`);
-            return true;
         }
-        return false;
+        catch (error) {
+            if (attempt < 3) {
+                console.log(`   ⚠️ Reversal attempt ${attempt} failed: ${error.message}, retrying...`);
+                continue;
+            }
+            console.error(`   ❌ Failed to reverse position after ${attempt} attempts: ${error.message}`);
+            return false;
+        }
     }
-    catch (error) {
-        console.error(`   ❌ Failed to reverse position: ${error.message}`);
-        return false;
-    }
+    return false;
 }
 /**
  * BOTH OR NOTHING: Wait for both orders, check positions continuously
@@ -518,31 +543,45 @@ export async function executeTrade(arb) {
     };
     console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
     console.log(`   Cost: $${costUsd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
-    console.log(`   Submitting MARKET-LIKE orders in parallel (no delay)...`);
-    // Use aggressive limit prices that act like market orders
-    // Set to max acceptable price to ensure immediate fills
-    const upMaxPrice = Math.min(upPrice * (1 + MARKET_ORDER_SLIPPAGE), 0.99);
-    const downMaxPrice = Math.min(downPrice * (1 + MARKET_ORDER_SLIPPAGE), 0.99);
-    const maxCombinedCost = upMaxPrice + downMaxPrice;
+    console.log(`   Fetching FRESH prices for TRUE MARKET ORDERS...`);
+    // Get FRESH prices RIGHT NOW (prices from scan may be stale)
+    const [freshUpResp, freshDownResp] = await Promise.all([
+        axios.get(`${CLOB_HOST}/price`, { params: { token_id: arb.up_token_id, side: 'buy' }, timeout: 200 }),
+        axios.get(`${CLOB_HOST}/price`, { params: { token_id: arb.down_token_id, side: 'buy' }, timeout: 200 }),
+    ]);
+    const freshUpPrice = parseFloat(freshUpResp.data?.price || '0');
+    const freshDownPrice = parseFloat(freshDownResp.data?.price || '0');
+    if (freshUpPrice === 0 || freshDownPrice === 0) {
+        console.log(`   ❌ Failed to get fresh prices - rejecting`);
+        return null;
+    }
+    // Use VERY aggressive limits (20% above current) to ensure immediate fills
+    // This acts like a true market order - will fill immediately if liquidity exists
+    const AGGRESSIVE_SLIPPAGE = 0.20; // 20% - ensures immediate fill
+    const upMarketPrice = Math.min(freshUpPrice * (1 + AGGRESSIVE_SLIPPAGE), 0.99);
+    const downMarketPrice = Math.min(freshDownPrice * (1 + AGGRESSIVE_SLIPPAGE), 0.99);
+    const maxCombinedCost = upMarketPrice + downMarketPrice;
     // Final safety check - ensure max combined cost is acceptable
     if (maxCombinedCost > MAX_COMBINED_COST) {
         console.log(`   ❌ Max combined cost $${maxCombinedCost.toFixed(4)} exceeds limit $${MAX_COMBINED_COST.toFixed(2)} - rejecting`);
         return null;
     }
-    console.log(`   UP max: $${upMaxPrice.toFixed(3)} (market-like)`);
-    console.log(`   DOWN max: $${downMaxPrice.toFixed(3)} (market-like)`);
+    console.log(`   Fresh prices: UP=$${freshUpPrice.toFixed(3)} DOWN=$${freshDownPrice.toFixed(3)}`);
+    console.log(`   Market orders: UP=$${upMarketPrice.toFixed(3)} DOWN=$${downMarketPrice.toFixed(3)} (20% buffer)`);
     console.log(`   Max combined: $${maxCombinedCost.toFixed(4)}`);
     try {
+        // Place BOTH orders simultaneously with TRUE MARKET prices (20% buffer)
+        console.log(`   🚀 Placing BOTH market orders simultaneously...`);
         const [upResult, downResult] = await Promise.all([
             clobClient.createAndPostOrder({
                 tokenID: arb.up_token_id,
-                price: upMaxPrice, // Market-like: aggressive limit at max acceptable price
+                price: upMarketPrice, // TRUE MARKET ORDER - 20% above current price
                 size: shares,
                 side: Side.BUY,
             }).catch(err => ({ error: err })),
             clobClient.createAndPostOrder({
                 tokenID: arb.down_token_id,
-                price: downMaxPrice, // Market-like: aggressive limit at max acceptable price
+                price: downMarketPrice, // TRUE MARKET ORDER - 20% above current price
                 size: shares,
                 side: Side.BUY,
             }).catch(err => ({ error: err })),
@@ -588,12 +627,44 @@ export async function executeTrade(arb) {
         console.log(`   ✓ DOWN order submitted: ${downOrderId}`);
         console.log(`   ⏳ Waiting for both orders to fill (max ${ORDER_FILL_TIMEOUT_MS / 1000}s)...`);
         // Wait for both orders to fill, place market order for second leg if one fills
-        const { upFilled, downFilled, secondLegOrderId, reversed } = await waitForBothOrders(upOrderId, downOrderId, arb.up_token_id, arb.down_token_id, shares, upMaxPrice, downMaxPrice);
+        const { upFilled, downFilled, secondLegOrderId, reversed } = await waitForBothOrders(upOrderId, downOrderId, arb.up_token_id, arb.down_token_id, shares, upMarketPrice, downMarketPrice);
         // Final position check (waitForBothOrders already checked, but double-check)
         const finalCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
         // Update order IDs if we placed a market order for second leg
         if (secondLegOrderId) {
             trade.down_order_id = secondLegOrderId;
+        }
+        // FINAL SAFETY CHECK: Always verify and reverse one-sided positions
+        // This is a last-ditch effort to prevent exposure
+        const safetyCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
+        const hasOneSided = (safetyCheck.hasUp && !safetyCheck.hasDown) || (!safetyCheck.hasUp && safetyCheck.hasDown);
+        if (hasOneSided) {
+            console.log(`   🚨 SAFETY CHECK: One-sided position detected! UP=${safetyCheck.upBalance.toFixed(1)} DOWN=${safetyCheck.downBalance.toFixed(1)}`);
+            console.log(`   🔄 FORCING REVERSAL...`);
+            let safetyReversed = false;
+            if (safetyCheck.hasUp && !safetyCheck.hasDown) {
+                safetyReversed = await reversePosition(arb.up_token_id, Math.floor(safetyCheck.upBalance));
+                if (safetyReversed) {
+                    console.log(`   ✅ UP position reversed (safety check)`);
+                }
+                else {
+                    console.log(`   ❌ FAILED to reverse UP position - MANUAL INTERVENTION NEEDED!`);
+                }
+            }
+            else if (!safetyCheck.hasUp && safetyCheck.hasDown) {
+                safetyReversed = await reversePosition(arb.down_token_id, Math.floor(safetyCheck.downBalance));
+                if (safetyReversed) {
+                    console.log(`   ✅ DOWN position reversed (safety check)`);
+                }
+                else {
+                    console.log(`   ❌ FAILED to reverse DOWN position - MANUAL INTERVENTION NEEDED!`);
+                }
+            }
+            trade.status = 'failed';
+            trade.error = `One-sided position detected and ${safetyReversed ? 'reversed' : 'reversal failed'}`;
+            console.log(`   📊 Continuing to scan for more opportunities...\n`);
+            executedTrades.push(trade);
+            return trade;
         }
         // BOTH OR NOTHING: Only success if we have both positions
         if (upFilled && downFilled && finalCheck.hasUp && finalCheck.hasDown) {
@@ -604,21 +675,11 @@ export async function executeTrade(arb) {
             console.log(`   📊 Continuing to scan for more opportunities...\n`);
         }
         else {
-            // Don't have both - trade failed (waitForBothOrders already reversed if needed)
+            // Don't have both - trade failed
             trade.status = 'failed';
             const posInfo = `UP=${finalCheck.upBalance.toFixed(1)} DOWN=${finalCheck.downBalance.toFixed(1)}`;
-            if (reversed) {
-                trade.error = 'Reversed one-sided position - no exposure';
-                console.log(`   ✅ Trade failed but position reversed - no exposure (${posInfo})`);
-            }
-            else if (finalCheck.hasUp || finalCheck.hasDown) {
-                trade.error = `One-sided position detected but reversal failed (${posInfo})`;
-                console.log(`   ⚠️ Trade failed - one-sided position but reversal failed (${posInfo})`);
-            }
-            else {
-                trade.error = 'Could not complete both legs - no positions detected';
-                console.log(`   ❌ Trade failed - no positions detected (${posInfo})`);
-            }
+            trade.error = 'Could not complete both legs';
+            console.log(`   ❌ Trade failed - ${posInfo}`);
             console.log(`   📊 Continuing to scan for more opportunities...\n`);
         }
     }
