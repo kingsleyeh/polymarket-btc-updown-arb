@@ -1,26 +1,37 @@
 /**
- * Real Trade Execution
+ * Real Trade Execution - Optimized
  * 
- * Executes actual trades on Polymarket using CLOB client
- * Fixed $5 per trade
+ * Features:
+ * - Parallel order execution
+ * - Dynamic sizing (% of balance)
+ * - Liquidity-aware (don't move the market)
+ * - Slippage protection
+ * - Price verification before execution
  */
 
 import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
+import axios from 'axios';
 import { ArbitrageOpportunity } from '../types/arbitrage';
 
-// Trade size
-const TRADE_SIZE_USD = 5; // $5 per trade
+// ============ CONFIGURATION ============
+const TRADE_SIZE_PERCENT = 0.20; // 20% of available balance per trade
+const MAX_TRADE_SIZE_USD = 50; // Cap at $50 per trade
+const MIN_TRADE_SIZE_USD = 2; // Minimum $2 per trade
+const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
+const SLIPPAGE_TOLERANCE = 0.005; // 0.5% slippage tolerance on price
+const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
 
-// Polymarket chain ID (Polygon)
+// Polymarket
 const CHAIN_ID = 137;
-
-// CLOB API
 const CLOB_HOST = 'https://clob.polymarket.com';
 
 // Client singleton
 let clobClient: ClobClient | null = null;
 let wallet: ethers.Wallet | null = null;
+let cachedBalance: number = 0;
+let lastBalanceUpdate: number = 0;
+const BALANCE_CACHE_MS = 30000; // Cache balance for 30 seconds
 
 // Track executed trades
 interface ExecutedTrade {
@@ -46,12 +57,6 @@ const executedTrades: ExecutedTrade[] = [];
 
 /**
  * Initialize the CLOB client with wallet
- * 
- * Per Polymarket docs:
- * - funder = Polymarket Profile Address (proxy wallet) where you send USDC
- * - signer = Private key wallet that signs transactions
- * - signatureType: 0 = Browser Wallet, 1 = Magic/Email Login
- * - Always derive API keys rather than creating new ones
  */
 export async function initializeTrader(): Promise<boolean> {
   const privateKey = process.env.POLYMARKET_PRIVATE_KEY;
@@ -61,26 +66,21 @@ export async function initializeTrader(): Promise<boolean> {
     return false;
   }
 
-  // Polymarket Profile Address (where USDC balance is)
   const funder = process.env.POLYMARKET_PROXY_WALLET || '';
-  // 0 = Browser/Metamask, 1 = Magic/Email Login
   const signatureType = parseInt(process.env.POLYMARKET_SIGNATURE_TYPE || '0', 10);
 
   try {
-    // Create signer wallet from private key
     wallet = new ethers.Wallet(privateKey);
     console.log(`Signer wallet: ${wallet.address}`);
     console.log(`Funder (profile): ${funder || 'not set'}`);
     console.log(`Signature type: ${signatureType} (${signatureType === 1 ? 'Magic/Email' : 'Browser'})`);
 
-    // Step 1: Create basic client to derive API credentials
     console.log('Deriving API credentials...');
     const basicClient = new ClobClient(CLOB_HOST, CHAIN_ID, wallet);
     const creds = await basicClient.createOrDeriveApiKey();
     
     console.log(`API Key: ${creds.key?.slice(0, 8)}...`);
 
-    // Step 2: Create full client with credentials, signature type, and funder
     clobClient = new ClobClient(
       CLOB_HOST,
       CHAIN_ID,
@@ -90,20 +90,15 @@ export async function initializeTrader(): Promise<boolean> {
       funder
     );
 
-    // Verify by checking balance
-    try {
-      const balance = await clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-      const usdBalance = parseFloat(balance.balance || '0') / 1_000_000;
-      console.log(`Balance: $${usdBalance.toFixed(2)} USDC`);
-
-      if (usdBalance < TRADE_SIZE_USD) {
-        console.warn(`WARNING: Low balance. Need $${TRADE_SIZE_USD}, have $${usdBalance.toFixed(2)}`);
-        // Continue anyway - balance might be in a different format or we might still be able to trade
-      }
-    } catch (balanceError: any) {
-      console.warn(`WARNING: Could not fetch balance: ${balanceError.message}`);
-      console.log('Continuing anyway - will check balance on trade execution');
-    }
+    // Get initial balance
+    await updateBalance();
+    
+    console.log(`\n📊 SIZING CONFIG:`);
+    console.log(`   Trade size: ${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of balance`);
+    console.log(`   Max per trade: $${MAX_TRADE_SIZE_USD}`);
+    console.log(`   Min per trade: $${MIN_TRADE_SIZE_USD}`);
+    console.log(`   Max liquidity take: ${(MAX_LIQUIDITY_PERCENT * 100).toFixed(0)}%`);
+    console.log(`   Slippage tolerance: ${(SLIPPAGE_TOLERANCE * 100).toFixed(1)}%`);
 
     return true;
   } catch (error: any) {
@@ -113,7 +108,172 @@ export async function initializeTrader(): Promise<boolean> {
 }
 
 /**
- * Execute arbitrage trade - buy both Up and Down
+ * Update cached balance
+ */
+async function updateBalance(): Promise<number> {
+  if (!clobClient) return 0;
+  
+  try {
+    const balance = await clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    cachedBalance = parseFloat(balance.balance || '0') / 1_000_000;
+    lastBalanceUpdate = Date.now();
+    console.log(`Balance: $${cachedBalance.toFixed(2)} USDC`);
+    return cachedBalance;
+  } catch (error: any) {
+    console.warn(`Could not fetch balance: ${error.message}`);
+    return cachedBalance;
+  }
+}
+
+/**
+ * Get current balance (cached)
+ */
+export async function getBalance(): Promise<number> {
+  if (Date.now() - lastBalanceUpdate > BALANCE_CACHE_MS) {
+    return await updateBalance();
+  }
+  return cachedBalance;
+}
+
+/**
+ * Fetch current orderbook to verify prices and get liquidity
+ */
+async function verifyPricesAndLiquidity(
+  upTokenId: string,
+  downTokenId: string,
+  expectedUpPrice: number,
+  expectedDownPrice: number
+): Promise<{
+  verified: boolean;
+  upPrice: number;
+  downPrice: number;
+  upLiquidity: number;
+  downLiquidity: number;
+  reason?: string;
+}> {
+  try {
+    // Fetch both orderbooks in parallel
+    const [upPriceResp, downPriceResp, upBook, downBook] = await Promise.all([
+      axios.get(`${CLOB_HOST}/price`, { params: { token_id: upTokenId, side: 'buy' }, timeout: 3000 }),
+      axios.get(`${CLOB_HOST}/price`, { params: { token_id: downTokenId, side: 'buy' }, timeout: 3000 }),
+      axios.get(`${CLOB_HOST}/book`, { params: { token_id: upTokenId }, timeout: 3000 }),
+      axios.get(`${CLOB_HOST}/book`, { params: { token_id: downTokenId }, timeout: 3000 }),
+    ]);
+
+    const currentUpPrice = parseFloat(upPriceResp.data?.price || '0');
+    const currentDownPrice = parseFloat(downPriceResp.data?.price || '0');
+    
+    // Get liquidity at best ask
+    const upAsks = upBook.data?.asks || [];
+    const downAsks = downBook.data?.asks || [];
+    const upLiquidity = upAsks.length > 0 ? parseFloat(upAsks[0].size) : 0;
+    const downLiquidity = downAsks.length > 0 ? parseFloat(downAsks[0].size) : 0;
+
+    // Check if prices moved too much
+    const upPriceChange = Math.abs(currentUpPrice - expectedUpPrice) / expectedUpPrice;
+    const downPriceChange = Math.abs(currentDownPrice - expectedDownPrice) / expectedDownPrice;
+
+    if (upPriceChange > PRICE_VERIFY_TOLERANCE) {
+      return {
+        verified: false,
+        upPrice: currentUpPrice,
+        downPrice: currentDownPrice,
+        upLiquidity,
+        downLiquidity,
+        reason: `UP price moved ${(upPriceChange * 100).toFixed(1)}% (was $${expectedUpPrice.toFixed(3)}, now $${currentUpPrice.toFixed(3)})`,
+      };
+    }
+
+    if (downPriceChange > PRICE_VERIFY_TOLERANCE) {
+      return {
+        verified: false,
+        upPrice: currentUpPrice,
+        downPrice: currentDownPrice,
+        upLiquidity,
+        downLiquidity,
+        reason: `DOWN price moved ${(downPriceChange * 100).toFixed(1)}% (was $${expectedDownPrice.toFixed(3)}, now $${currentDownPrice.toFixed(3)})`,
+      };
+    }
+
+    // Verify combined cost still gives us an arb
+    const combinedCost = currentUpPrice + currentDownPrice;
+    if (combinedCost >= 0.98) {
+      return {
+        verified: false,
+        upPrice: currentUpPrice,
+        downPrice: currentDownPrice,
+        upLiquidity,
+        downLiquidity,
+        reason: `No arb anymore - combined cost is now $${combinedCost.toFixed(4)}`,
+      };
+    }
+
+    return {
+      verified: true,
+      upPrice: currentUpPrice,
+      downPrice: currentDownPrice,
+      upLiquidity,
+      downLiquidity,
+    };
+  } catch (error: any) {
+    return {
+      verified: false,
+      upPrice: 0,
+      downPrice: 0,
+      upLiquidity: 0,
+      downLiquidity: 0,
+      reason: `Failed to verify prices: ${error.message}`,
+    };
+  }
+}
+
+/**
+ * Calculate optimal trade size
+ */
+function calculateTradeSize(
+  balance: number,
+  combinedCost: number,
+  upLiquidity: number,
+  downLiquidity: number
+): { shares: number; reason: string } {
+  // Start with % of balance
+  let targetUsd = balance * TRADE_SIZE_PERCENT;
+  let reason = `${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of balance`;
+
+  // Cap at max
+  if (targetUsd > MAX_TRADE_SIZE_USD) {
+    targetUsd = MAX_TRADE_SIZE_USD;
+    reason = `capped at max $${MAX_TRADE_SIZE_USD}`;
+  }
+
+  // Floor at min
+  if (targetUsd < MIN_TRADE_SIZE_USD) {
+    return { shares: 0, reason: `below min $${MIN_TRADE_SIZE_USD}` };
+  }
+
+  // Calculate shares from USD
+  let shares = Math.floor(targetUsd / combinedCost);
+
+  // Respect liquidity - don't take more than MAX_LIQUIDITY_PERCENT of available
+  const maxUpShares = Math.floor(upLiquidity * MAX_LIQUIDITY_PERCENT);
+  const maxDownShares = Math.floor(downLiquidity * MAX_LIQUIDITY_PERCENT);
+  const liquidityLimit = Math.min(maxUpShares, maxDownShares);
+
+  if (shares > liquidityLimit && liquidityLimit > 0) {
+    shares = liquidityLimit;
+    reason = `limited by liquidity (${(MAX_LIQUIDITY_PERCENT * 100).toFixed(0)}% of ${Math.min(upLiquidity, downLiquidity).toFixed(0)} available)`;
+  }
+
+  // Final check
+  if (shares < 1) {
+    return { shares: 0, reason: 'insufficient liquidity' };
+  }
+
+  return { shares, reason };
+}
+
+/**
+ * Execute arbitrage trade - buy both Up and Down in PARALLEL
  */
 export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null> {
   if (!clobClient || !wallet) {
@@ -122,99 +282,130 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
   }
 
   const now = Date.now();
-  
-  // Calculate shares to buy with $5
-  // We need to buy BOTH sides, so split the $5
-  // Actually no - we buy $5 worth of EACH side
-  // Total cost = shares * (up_price + down_price)
-  // We want total cost = $5
-  // shares = $5 / combined_cost
-  const shares = Math.floor(TRADE_SIZE_USD / arb.combined_cost);
-  
-  if (shares < 1) {
-    console.log('Trade too small - skipping');
+
+  // Step 1: Verify prices haven't moved
+  console.log(`\n🔍 VERIFYING PRICES...`);
+  const verification = await verifyPricesAndLiquidity(
+    arb.up_token_id,
+    arb.down_token_id,
+    arb.up_price,
+    arb.down_price
+  );
+
+  if (!verification.verified) {
+    console.log(`   ❌ ${verification.reason}`);
     return null;
   }
 
+  // Use verified current prices
+  const upPrice = verification.upPrice;
+  const downPrice = verification.downPrice;
+  const combinedCost = upPrice + downPrice;
+
+  console.log(`   ✓ Prices verified: UP=$${upPrice.toFixed(3)} DOWN=$${downPrice.toFixed(3)} = $${combinedCost.toFixed(4)}`);
+  console.log(`   ✓ Liquidity: UP=${verification.upLiquidity.toFixed(0)} DOWN=${verification.downLiquidity.toFixed(0)}`);
+
+  // Step 2: Calculate optimal size
+  const balance = await getBalance();
+  const { shares, reason } = calculateTradeSize(
+    balance,
+    combinedCost,
+    verification.upLiquidity,
+    verification.downLiquidity
+  );
+
+  if (shares < 1) {
+    console.log(`   ❌ Cannot trade: ${reason}`);
+    return null;
+  }
+
+  const costUsd = shares * combinedCost;
+  const profitUsd = shares * (1.0 - combinedCost);
+
+  console.log(`   ✓ Size: ${shares} shares (${reason})`);
+
+  // Step 3: Prepare trade record
   const trade: ExecutedTrade = {
     id: `trade-${now}`,
     market_id: arb.market_id,
     market_title: arb.market_title,
     up_order_id: null,
     down_order_id: null,
-    up_price: arb.up_price,
-    down_price: arb.down_price,
-    combined_cost: arb.combined_cost,
+    up_price: upPrice,
+    down_price: downPrice,
+    combined_cost: combinedCost,
     shares,
-    cost_usd: shares * arb.combined_cost,
-    guaranteed_payout: shares * 1.0, // $1 per share at expiry
-    profit_usd: shares * (1.0 - arb.combined_cost),
+    cost_usd: costUsd,
+    guaranteed_payout: shares * 1.0,
+    profit_usd: profitUsd,
     timestamp: now,
     expiry_timestamp: arb.expiry_timestamp,
     status: 'pending',
   };
 
+  console.log(`\n💰 EXECUTING TRADE: ${arb.market_title}`);
+  console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
+  console.log(`   Cost: $${costUsd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
+
+  // Step 4: Execute BOTH orders in PARALLEL
+  console.log(`   Submitting orders in parallel...`);
+  
+  // Add slippage to ensure fill
+  const upPriceWithSlippage = Math.min(upPrice * (1 + SLIPPAGE_TOLERANCE), 0.99);
+  const downPriceWithSlippage = Math.min(downPrice * (1 + SLIPPAGE_TOLERANCE), 0.99);
+
   try {
-    console.log(`\n💰 EXECUTING TRADE: ${arb.market_title}`);
-    console.log(`   Buying ${shares} shares @ $${arb.combined_cost.toFixed(4)}`);
-    console.log(`   Cost: $${trade.cost_usd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${trade.profit_usd.toFixed(2)}`);
-
-    // Buy UP shares
-    console.log(`   Buying UP @ $${arb.up_price.toFixed(3)}...`);
-    let upOrder;
-    try {
-      upOrder = await clobClient.createAndPostOrder({
+    const [upResult, downResult] = await Promise.all([
+      clobClient.createAndPostOrder({
         tokenID: arb.up_token_id,
-        price: arb.up_price,
+        price: upPriceWithSlippage,
         size: shares,
         side: Side.BUY,
-      });
-      
-      if (!upOrder || !upOrder.orderID) {
-        throw new Error('No order ID returned');
-      }
-      trade.up_order_id = upOrder.orderID;
-      console.log(`   ✓ UP order: ${trade.up_order_id}`);
-    } catch (upError: any) {
-      const errMsg = upError.message || 'Unknown error';
-      if (errMsg.includes('403') || errMsg.includes('blocked') || errMsg.includes('Cloudflare')) {
-        console.error(`   ❌ UP order BLOCKED by Cloudflare - Replit IPs are blocked`);
-        console.error(`   ⚠️  Run this bot locally or on a VPS to execute trades`);
-      } else {
-        console.error(`   ❌ UP order failed: ${errMsg}`);
-      }
-      throw upError;
-    }
-
-    // Buy DOWN shares
-    console.log(`   Buying DOWN @ $${arb.down_price.toFixed(3)}...`);
-    let downOrder;
-    try {
-      downOrder = await clobClient.createAndPostOrder({
+      }).catch(err => ({ error: err })),
+      clobClient.createAndPostOrder({
         tokenID: arb.down_token_id,
-        price: arb.down_price,
+        price: downPriceWithSlippage,
         size: shares,
         side: Side.BUY,
-      });
-      
-      if (!downOrder || !downOrder.orderID) {
-        throw new Error('No order ID returned');
-      }
-      trade.down_order_id = downOrder.orderID;
-      console.log(`   ✓ DOWN order: ${trade.down_order_id}`);
-    } catch (downError: any) {
-      const errMsg = downError.message || 'Unknown error';
-      if (errMsg.includes('403') || errMsg.includes('blocked') || errMsg.includes('Cloudflare')) {
-        console.error(`   ❌ DOWN order BLOCKED by Cloudflare - Replit IPs are blocked`);
-        console.error(`   ⚠️  Run this bot locally or on a VPS to execute trades`);
-      } else {
-        console.error(`   ❌ DOWN order failed: ${errMsg}`);
-      }
-      throw downError;
+      }).catch(err => ({ error: err })),
+    ]);
+
+    // Check results
+    const upSuccess = upResult && !('error' in upResult) && upResult.orderID;
+    const downSuccess = downResult && !('error' in downResult) && downResult.orderID;
+
+    if (upSuccess) {
+      trade.up_order_id = (upResult as any).orderID;
+      console.log(`   ✓ UP order: ${trade.up_order_id}`);
+    } else {
+      const errMsg = ('error' in upResult) ? (upResult.error as any).message : 'No order ID';
+      console.error(`   ❌ UP order failed: ${errMsg}`);
     }
 
-    trade.status = 'filled';
-    console.log(`   ✅ TRADE COMPLETE - Profit locked: $${trade.profit_usd.toFixed(2)}`);
+    if (downSuccess) {
+      trade.down_order_id = (downResult as any).orderID;
+      console.log(`   ✓ DOWN order: ${trade.down_order_id}`);
+    } else {
+      const errMsg = ('error' in downResult) ? (downResult.error as any).message : 'No order ID';
+      console.error(`   ❌ DOWN order failed: ${errMsg}`);
+    }
+
+    // Determine trade status
+    if (upSuccess && downSuccess) {
+      trade.status = 'filled';
+      console.log(`   ✅ TRADE COMPLETE - Profit locked: $${profitUsd.toFixed(2)}`);
+      
+      // Update balance cache
+      cachedBalance -= costUsd;
+      console.log(`   💵 Remaining balance: ~$${cachedBalance.toFixed(2)}`);
+    } else if (upSuccess || downSuccess) {
+      trade.status = 'partial';
+      console.log(`   ⚠️ PARTIAL FILL - One side failed`);
+    } else {
+      trade.status = 'failed';
+      trade.error = 'Both orders failed';
+      console.log(`   ❌ TRADE FAILED - Both orders rejected`);
+    }
 
   } catch (error: any) {
     trade.status = 'failed';
@@ -277,4 +468,3 @@ export function getExecutionStats(): {
 export function isTraderReady(): boolean {
   return clobClient !== null && wallet !== null;
 }
-
