@@ -1,0 +1,13 @@
+run = "npm run build && node dist/index.js"
+entrypoint = "src/index.ts"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "node dist/index.js"]
+build = ["sh", "-c", "npm install && npm run build"]
+
+[[ports]]
+localPort = 3000
+externalPort = 80

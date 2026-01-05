@@ -1,0 +1,9 @@
+timestamp,market_id,market_title,expiry_timestamp,up_price,down_price,combined_cost,simulated_shares,guaranteed_profit,up_liquidity,down_liquidity,time_to_expiry_at_entry,persistence_duration_sec,scan_cycles_observed,disappearance_reason
+2026-01-05T17:39:55.247Z,1106006,"Ethereum Up or Down - January 5, 12:45PM-1:00PM ET",1767636000000,0.4800,0.4900,0.9700,100.00,3.0000,6582.13,6568.00,1205,0.0,1,still_active
+2026-01-05T17:39:57.399Z,1098297,"Bitcoin Up or Down - January 5, 1PM ET",1767639600000,0.4800,0.4900,0.9700,100.00,3.0000,1566.91,1567.36,4803,0.0,1,still_active
+2026-01-05T17:40:01.388Z,1099158,"Bitcoin Up or Down - January 5, 3PM ET",1767646800000,0.4800,0.4800,0.9600,100.00,4.0000,1544.18,1558.79,11999,0.0,1,still_active
+2026-01-05T17:40:05.699Z,1100715,"Bitcoin Up or Down - January 5, 7PM ET",1767661200000,0.4700,0.4800,0.9500,100.00,5.0000,1544.34,1559.18,26394,0.0,1,still_active
+2026-01-05T17:40:19.218Z,1102799,"Bitcoin Up or Down - January 6, 2AM ET",1767686400000,0.5000,0.4700,0.9700,100.00,3.0000,1553.87,1549.02,51581,0.0,1,still_active
+2026-01-05T17:49:36.355Z,1106008,"Bitcoin Up or Down - January 5, 12:45PM-1:00PM ET",1767636000000,0.5700,0.4200,0.9900,100.00,1.0000,12606.76,12389.62,605,19.1,64,still_active
+2026-01-05T17:52:05.138Z,1106008,"Bitcoin Up or Down - January 5, 12:45PM-1:00PM ET",1767636000000,0.8100,0.1600,0.9700,100.00,3.0000,13816.25,13297.60,475,0.0,1,price_moved
+2026-01-05T17:53:54.126Z,1106008,"Bitcoin Up or Down - January 5, 12:45PM-1:00PM ET",1767636000000,0.8400,0.1200,0.9600,100.00,4.0000,13365.50,12917.60,366,0.0,1,price_moved
