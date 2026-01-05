@@ -1,8 +1,12 @@
 /**
- * Real Trade Execution
+ * Real Trade Execution - Optimized
  *
- * Executes actual trades on Polymarket using CLOB client
- * Fixed $5 per trade
+ * Features:
+ * - Parallel order execution
+ * - Dynamic sizing (% of balance)
+ * - Liquidity-aware (don't move the market)
+ * - Slippage protection
+ * - Price verification before execution
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -25,16 +29,14 @@ interface ExecutedTrade {
 }
 /**
  * Initialize the CLOB client with wallet
- *
- * Per Polymarket docs:
- * - funder = Polymarket Profile Address (proxy wallet) where you send USDC
- * - signer = Private key wallet that signs transactions
- * - signatureType: 0 = Browser Wallet, 1 = Magic/Email Login
- * - Always derive API keys rather than creating new ones
  */
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * Execute arbitrage trade - buy both Up and Down
+ * Get current balance (cached)
+ */
+export declare function getBalance(): Promise<number>;
+/**
+ * Execute arbitrage trade - buy both Up and Down in PARALLEL
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 /**
