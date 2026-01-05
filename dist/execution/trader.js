@@ -18,10 +18,10 @@ const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liq
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
 const MARKET_ORDER_SLIPPAGE = 0.02; // 2% - use aggressive limit prices that act like market orders
 const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
-const ORDER_FILL_TIMEOUT_MS = 1000; // 1 second MAX to wait for both orders
-const ORDER_CHECK_INTERVAL_MS = 100; // Check every 100ms
-const POSITION_CHECK_INTERVAL_MS = 200; // Check actual positions every 200ms
-const MAX_WAIT_FOR_BOTH_MS = 1000; // Maximum 1 second - if not both, reverse immediately
+const ORDER_FILL_TIMEOUT_MS = 500; // 500ms MAX - racing other bots
+const ORDER_CHECK_INTERVAL_MS = 50; // Check every 50ms (fast)
+const POSITION_CHECK_INTERVAL_MS = 100; // Check actual positions every 100ms (fast)
+const MAX_WAIT_FOR_BOTH_MS = 500; // Maximum 500ms - if not both, reverse immediately
 // Polymarket
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -309,11 +309,11 @@ async function checkPositions(upTokenId, downTokenId, expectedShares) {
             const [upResp, downResp] = await Promise.all([
                 axios.get(`${CLOB_HOST}/balance`, {
                     params: { token_id: upTokenId },
-                    timeout: 2000,
+                    timeout: 500, // Fast timeout for speed
                 }).catch(() => ({ data: { balance: '0' } })),
                 axios.get(`${CLOB_HOST}/balance`, {
                     params: { token_id: downTokenId },
-                    timeout: 2000,
+                    timeout: 500, // Fast timeout for speed
                 }).catch(() => ({ data: { balance: '0' } })),
             ]);
             const upBal = parseFloat(upResp.data?.balance || '0') / 1_000_000;
@@ -335,10 +335,10 @@ async function reversePosition(tokenId, shares) {
     if (!clobClient)
         return false;
     try {
-        // Get current price to sell at market
+        // Get current price to sell at market (fast timeout)
         const priceResp = await axios.get(`${CLOB_HOST}/price`, {
             params: { token_id: tokenId, side: 'sell' },
-            timeout: 1000,
+            timeout: 300, // Fast - racing other bots
         });
         const sellPrice = parseFloat(priceResp.data?.price || '0');
         if (sellPrice === 0)
@@ -375,81 +375,79 @@ async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId,
     let secondLegOrderId = null;
     let marketOrderPlaced = false;
     let lastPositionCheck = 0;
-    // Aggressive loop: check positions every 200ms, max 1 second
+    // IMMEDIATE first check (no delay) - racing other bots
+    let positions = await checkPositions(upTokenId, downTokenId, shares);
+    if (positions.hasUp && positions.hasDown) {
+        // Both filled - cancel pending orders in parallel (fast)
+        await Promise.all([
+            cancelOrder(upOrderId),
+            cancelOrder(downOrderId),
+        ]);
+        return { upFilled: true, downFilled: true, secondLegOrderId: null, reversed: false };
+    }
+    // If one filled, place market order IMMEDIATELY (no waiting, no logging)
+    if (positions.hasUp && !positions.hasDown && !marketOrderPlaced) {
+        marketOrderPlaced = true;
+        secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
+    }
+    else if (!positions.hasUp && positions.hasDown && !marketOrderPlaced) {
+        marketOrderPlaced = true;
+        secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
+    }
+    // Fast polling loop: check positions every 100ms, max 500ms
     while (Date.now() - startTime < MAX_WAIT_FOR_BOTH_MS) {
         const elapsed = Date.now() - startTime;
-        // Check ACTUAL positions (not just order status) every 200ms
+        // Check positions every 100ms
         if (Date.now() - lastPositionCheck >= POSITION_CHECK_INTERVAL_MS) {
             lastPositionCheck = Date.now();
-            const positions = await checkPositions(upTokenId, downTokenId, shares);
-            const hasUp = positions.hasUp;
-            const hasDown = positions.hasDown;
-            // BOTH POSITIONS - SUCCESS!
-            if (hasUp && hasDown) {
-                console.log(`   ✅ BOTH POSITIONS CONFIRMED after ${(elapsed / 1000).toFixed(2)}s`);
-                // Cancel any pending orders
-                await cancelOrder(upOrderId);
-                await cancelOrder(downOrderId);
-                if (secondLegOrderId)
-                    await cancelOrder(secondLegOrderId);
+            positions = await checkPositions(upTokenId, downTokenId, shares);
+            // BOTH POSITIONS - SUCCESS! (cancel in parallel for speed)
+            if (positions.hasUp && positions.hasDown) {
+                await Promise.all([
+                    cancelOrder(upOrderId),
+                    cancelOrder(downOrderId),
+                    secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
+                ]);
                 return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
             }
-            // ONE-SIDED: Place market order for missing leg IMMEDIATELY
-            if (hasUp && !hasDown && !marketOrderPlaced) {
-                console.log(`   ⚠️ Have UP but no DOWN - placing MARKET order for DOWN NOW...`);
+            // ONE-SIDED: Place market order if not already placed (no logging for speed)
+            if (positions.hasUp && !positions.hasDown && !marketOrderPlaced) {
                 marketOrderPlaced = true;
                 secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
-                if (secondLegOrderId) {
-                    console.log(`   ✓ Market order placed: ${secondLegOrderId}`);
-                }
             }
-            else if (!hasUp && hasDown && !marketOrderPlaced) {
-                console.log(`   ⚠️ Have DOWN but no UP - placing MARKET order for UP NOW...`);
+            else if (!positions.hasUp && positions.hasDown && !marketOrderPlaced) {
                 marketOrderPlaced = true;
                 secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
-                if (secondLegOrderId) {
-                    console.log(`   ✓ Market order placed: ${secondLegOrderId}`);
-                }
             }
         }
-        await new Promise(r => setTimeout(r, 50)); // Fast polling
+        await new Promise(r => setTimeout(r, 25)); // Ultra-fast polling (25ms)
     }
-    // TIMEOUT: Check final positions
+    // TIMEOUT: Check final positions (fast)
     const finalPositions = await checkPositions(upTokenId, downTokenId, shares);
     const hasUp = finalPositions.hasUp;
     const hasDown = finalPositions.hasDown;
-    // BOTH - Success (caught it at the last moment)
+    // BOTH - Success (cancel in parallel)
     if (hasUp && hasDown) {
-        console.log(`   ✅ BOTH POSITIONS CONFIRMED (at timeout)`);
-        await cancelOrder(upOrderId);
-        await cancelOrder(downOrderId);
-        if (secondLegOrderId)
-            await cancelOrder(secondLegOrderId);
+        await Promise.all([
+            cancelOrder(upOrderId),
+            cancelOrder(downOrderId),
+            secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
+        ]);
         return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
     }
-    // ONE-SIDED OR NONE - REVERSE IMMEDIATELY
-    console.log(`   ❌ TIMEOUT: Don't have both positions - REVERSING everything...`);
-    // Cancel all pending orders
+    // ONE-SIDED OR NONE - REVERSE IMMEDIATELY (cancel and reverse in parallel where possible)
     await Promise.all([
         cancelOrder(upOrderId),
         cancelOrder(downOrderId),
         secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
     ]);
-    // Reverse any filled leg
+    // Reverse any filled leg (fast)
     let reversed = false;
     if (hasUp && !hasDown) {
-        console.log(`   🔄 Reversing ${finalPositions.upBalance.toFixed(0)} UP shares...`);
         reversed = await reversePosition(upTokenId, Math.floor(finalPositions.upBalance));
     }
     else if (!hasUp && hasDown) {
-        console.log(`   🔄 Reversing ${finalPositions.downBalance.toFixed(0)} DOWN shares...`);
         reversed = await reversePosition(downTokenId, Math.floor(finalPositions.downBalance));
-    }
-    if (reversed) {
-        console.log(`   ✅ Position reversed - no exposure`);
-    }
-    else {
-        console.log(`   ⚠️ Reversal may have failed - check positions manually`);
     }
     return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
 }
