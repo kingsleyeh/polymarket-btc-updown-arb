@@ -1,6 +1,5 @@
-"use strict";
 /**
  * Types for BTC Up/Down Arbitrage
  */
-Object.defineProperty(exports, "__esModule", { value: true });
+export {};
 //# sourceMappingURL=arbitrage.js.map

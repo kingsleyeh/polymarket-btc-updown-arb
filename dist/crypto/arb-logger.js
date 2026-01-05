@@ -1,53 +1,10 @@
-"use strict";
 /**
  * Arbitrage Logger
  *
  * Writes arb data to CSV and JSON files for offline analysis
  */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.initializeLogFiles = initializeLogFiles;
-exports.logArbitrage = logArbitrage;
-exports.logPaperTrade = logPaperTrade;
-exports.incrementScanCount = incrementScanCount;
-exports.incrementArbCount = incrementArbCount;
-exports.getScanStats = getScanStats;
-exports.getLoggedArbs = getLoggedArbs;
-exports.resetStats = resetStats;
-const fs = __importStar(require("fs"));
-const path = __importStar(require("path"));
+import * as fs from 'fs';
+import * as path from 'path';
 // File paths
 const DATA_DIR = path.join(process.cwd(), 'data');
 const ARB_LOG_CSV = path.join(DATA_DIR, 'arbitrage_log.csv');
@@ -83,7 +40,7 @@ function ensureDataDir() {
 /**
  * Initialize log files
  */
-function initializeLogFiles() {
+export function initializeLogFiles() {
     ensureDataDir();
     // Initialize CSV with header if not exists
     if (!fs.existsSync(ARB_LOG_CSV)) {
@@ -111,7 +68,7 @@ function initializeLogFiles() {
 /**
  * Log an arbitrage entry
  */
-function logArbitrage(entry) {
+export function logArbitrage(entry) {
     ensureDataDir();
     // Append to CSV
     const csvLine = [
@@ -145,7 +102,7 @@ function logArbitrage(entry) {
 /**
  * Log a paper trade
  */
-function logPaperTrade(trade) {
+export function logPaperTrade(trade) {
     ensureDataDir();
     try {
         const existing = JSON.parse(fs.readFileSync(PAPER_TRADES_JSON, 'utf-8'));
@@ -159,7 +116,7 @@ function logPaperTrade(trade) {
 /**
  * Increment scan count
  */
-function incrementScanCount(marketsScanned) {
+export function incrementScanCount(marketsScanned) {
     ensureDataDir();
     try {
         const stats = getScanStats();
@@ -176,7 +133,7 @@ function incrementScanCount(marketsScanned) {
 /**
  * Increment arb count
  */
-function incrementArbCount() {
+export function incrementArbCount() {
     ensureDataDir();
     try {
         const stats = getScanStats();
@@ -192,7 +149,7 @@ function incrementArbCount() {
 /**
  * Get current scan stats
  */
-function getScanStats() {
+export function getScanStats() {
     ensureDataDir();
     try {
         if (fs.existsSync(SCAN_STATS_JSON)) {
@@ -213,7 +170,7 @@ function getScanStats() {
 /**
  * Get all logged arbs
  */
-function getLoggedArbs() {
+export function getLoggedArbs() {
     try {
         if (fs.existsSync(ARB_LOG_JSON)) {
             return JSON.parse(fs.readFileSync(ARB_LOG_JSON, 'utf-8'));
@@ -227,7 +184,7 @@ function getLoggedArbs() {
 /**
  * Reset stats for new session
  */
-function resetStats() {
+export function resetStats() {
     ensureDataDir();
     const stats = {
         total_scans: 0,

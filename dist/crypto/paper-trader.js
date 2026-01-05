@@ -1,17 +1,9 @@
-"use strict";
 /**
  * Paper Trading Simulator
  *
  * Simulates buy-and-hold arbitrage trades
  * NO real orders - paper trading only
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.simulateTrade = simulateTrade;
-exports.getPaperTrades = getPaperTrades;
-exports.getOpenTrades = getOpenTrades;
-exports.settleExpiredTrades = settleExpiredTrades;
-exports.getPaperStats = getPaperStats;
-exports.resetPaperTrading = resetPaperTrading;
 // Track all paper trades
 const paperTrades = [];
 // Running totals
@@ -20,7 +12,7 @@ let totalTradesCount = 0;
 /**
  * Simulate a paper trade for an arbitrage opportunity
  */
-function simulateTrade(arb) {
+export function simulateTrade(arb) {
     const now = Date.now();
     const trade = {
         id: `paper-${now}-${Math.random().toString(36).slice(2, 8)}`,
@@ -46,19 +38,19 @@ function simulateTrade(arb) {
 /**
  * Get all paper trades
  */
-function getPaperTrades() {
+export function getPaperTrades() {
     return [...paperTrades];
 }
 /**
  * Get open paper trades
  */
-function getOpenTrades() {
+export function getOpenTrades() {
     return paperTrades.filter(t => t.status === 'open');
 }
 /**
  * Settle expired trades
  */
-function settleExpiredTrades() {
+export function settleExpiredTrades() {
     const now = Date.now();
     const settled = [];
     for (const trade of paperTrades) {
@@ -73,7 +65,7 @@ function settleExpiredTrades() {
 /**
  * Get paper trading statistics
  */
-function getPaperStats() {
+export function getPaperStats() {
     const openTrades = paperTrades.filter(t => t.status === 'open');
     const settledTrades = paperTrades.filter(t => t.status === 'settled');
     let totalTimeToExpiry = 0;
@@ -92,7 +84,7 @@ function getPaperStats() {
 /**
  * Reset paper trading (for testing)
  */
-function resetPaperTrading() {
+export function resetPaperTrading() {
     paperTrades.length = 0;
     totalProfit = 0;
     totalTradesCount = 0;

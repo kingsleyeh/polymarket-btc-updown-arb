@@ -1,18 +1,11 @@
-"use strict";
 /**
  * BTC Up/Down 15-Minute Market Scanner
  *
  * Finds ONLY the CURRENT BTC 15-minute Up/Down market on Polymarket
  * Series 10192 = Bitcoin 15-minute markets
  */
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.scanBTCUpDownMarkets = scanBTCUpDownMarkets;
-exports.getMarketSummary = getMarketSummary;
-const axios_1 = __importDefault(require("axios"));
-const constants_1 = require("../config/constants");
+import axios from 'axios';
+import { GAMMA_API_URL, EXPIRY_CUTOFF_SECONDS } from '../config/constants';
 /**
  * Check if a market title indicates a 15-minute window (has time range like "12:45PM-1:00PM")
  */
@@ -24,12 +17,12 @@ function is15MinuteMarket(question) {
 /**
  * Scan for the CURRENT BTC 15-minute Up/Down market only
  */
-async function scanBTCUpDownMarkets() {
+export async function scanBTCUpDownMarkets() {
     const markets = [];
     const now = Date.now();
     try {
         // Series 10192 = BTC 15-minute Up/Down markets
-        const response = await axios_1.default.get(`${constants_1.GAMMA_API_URL}/events`, {
+        const response = await axios.get(`${GAMMA_API_URL}/events`, {
             params: {
                 series_id: 10192,
                 active: true,
@@ -73,7 +66,7 @@ async function scanBTCUpDownMarkets() {
             const expiryTimestamp = new Date(endDate).getTime();
             const timeToExpiry = (expiryTimestamp - now) / 1000;
             // Skip if already expired or too close to expiry
-            if (timeToExpiry <= constants_1.EXPIRY_CUTOFF_SECONDS)
+            if (timeToExpiry <= EXPIRY_CUTOFF_SECONDS)
                 continue;
             // Parse tokens
             let tokenIds;
@@ -114,7 +107,7 @@ async function scanBTCUpDownMarkets() {
 /**
  * Get market summary
  */
-function getMarketSummary(markets) {
+export function getMarketSummary(markets) {
     const now = Date.now();
     let totalTime = 0;
     let expiringSoon = 0;

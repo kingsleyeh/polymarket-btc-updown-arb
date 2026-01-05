@@ -1,18 +1,11 @@
-"use strict";
 /**
  * Real Trade Execution
  *
  * Executes actual trades on Polymarket using CLOB client
  * Fixed $5 per trade
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.initializeTrader = initializeTrader;
-exports.executeTrade = executeTrade;
-exports.getExecutedTrades = getExecutedTrades;
-exports.getExecutionStats = getExecutionStats;
-exports.isTraderReady = isTraderReady;
-const clob_client_1 = require("@polymarket/clob-client");
-const ethers_1 = require("ethers");
+import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
+import { ethers } from 'ethers';
 // Trade size
 const TRADE_SIZE_USD = 5; // $5 per trade
 // Polymarket chain ID (Polygon)
@@ -32,7 +25,7 @@ const executedTrades = [];
  * - signatureType: 0 = Browser Wallet, 1 = Magic/Email Login
  * - Always derive API keys rather than creating new ones
  */
-async function initializeTrader() {
+export async function initializeTrader() {
     const privateKey = process.env.POLYMARKET_PRIVATE_KEY;
     if (!privateKey) {
         console.error('ERROR: POLYMARKET_PRIVATE_KEY not set');
@@ -44,20 +37,20 @@ async function initializeTrader() {
     const signatureType = parseInt(process.env.POLYMARKET_SIGNATURE_TYPE || '0', 10);
     try {
         // Create signer wallet from private key
-        wallet = new ethers_1.ethers.Wallet(privateKey);
+        wallet = new ethers.Wallet(privateKey);
         console.log(`Signer wallet: ${wallet.address}`);
         console.log(`Funder (profile): ${funder || 'not set'}`);
         console.log(`Signature type: ${signatureType} (${signatureType === 1 ? 'Magic/Email' : 'Browser'})`);
         // Step 1: Create basic client to derive API credentials
         console.log('Deriving API credentials...');
-        const basicClient = new clob_client_1.ClobClient(CLOB_HOST, CHAIN_ID, wallet);
+        const basicClient = new ClobClient(CLOB_HOST, CHAIN_ID, wallet);
         const creds = await basicClient.createOrDeriveApiKey();
         console.log(`API Key: ${creds.key?.slice(0, 8)}...`);
         // Step 2: Create full client with credentials, signature type, and funder
-        clobClient = new clob_client_1.ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, signatureType, funder);
+        clobClient = new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, signatureType, funder);
         // Verify by checking balance
         try {
-            const balance = await clobClient.getBalanceAllowance({ asset_type: clob_client_1.AssetType.COLLATERAL });
+            const balance = await clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
             const usdBalance = parseFloat(balance.balance || '0') / 1_000_000;
             console.log(`Balance: $${usdBalance.toFixed(2)} USDC`);
             if (usdBalance < TRADE_SIZE_USD) {
@@ -79,7 +72,7 @@ async function initializeTrader() {
 /**
  * Execute arbitrage trade - buy both Up and Down
  */
-async function executeTrade(arb) {
+export async function executeTrade(arb) {
     if (!clobClient || !wallet) {
         console.error('Trader not initialized');
         return null;
@@ -125,7 +118,7 @@ async function executeTrade(arb) {
                 tokenID: arb.up_token_id,
                 price: arb.up_price,
                 size: shares,
-                side: clob_client_1.Side.BUY,
+                side: Side.BUY,
             });
             if (!upOrder || !upOrder.orderID) {
                 throw new Error('No order ID returned');
@@ -152,7 +145,7 @@ async function executeTrade(arb) {
                 tokenID: arb.down_token_id,
                 price: arb.down_price,
                 size: shares,
-                side: clob_client_1.Side.BUY,
+                side: Side.BUY,
             });
             if (!downOrder || !downOrder.orderID) {
                 throw new Error('No order ID returned');
@@ -185,13 +178,13 @@ async function executeTrade(arb) {
 /**
  * Get all executed trades
  */
-function getExecutedTrades() {
+export function getExecutedTrades() {
     return [...executedTrades];
 }
 /**
  * Get execution stats
  */
-function getExecutionStats() {
+export function getExecutionStats() {
     let successful = 0;
     let failed = 0;
     let totalCost = 0;
@@ -220,7 +213,7 @@ function getExecutionStats() {
 /**
  * Check if trader is ready
  */
-function isTraderReady() {
+export function isTraderReady() {
     return clobClient !== null && wallet !== null;
 }
 //# sourceMappingURL=trader.js.map

@@ -1,22 +1,11 @@
-"use strict";
 /**
  * BTC Up/Down Arbitrage Detection
  *
  * Detects opportunities where:
  * buy_up_price + buy_down_price < 1.00 - MIN_EDGE
  */
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.fetchMarketPrices = fetchMarketPrices;
-exports.checkArbitrage = checkArbitrage;
-exports.updateArbTracking = updateArbTracking;
-exports.getActiveArbs = getActiveArbs;
-exports.clearArbs = clearArbs;
-exports.getArbPersistence = getArbPersistence;
-const axios_1 = __importDefault(require("axios"));
-const constants_1 = require("../config/constants");
+import axios from 'axios';
+import { CLOB_API_URL, MIN_EDGE, EXPIRY_CUTOFF_SECONDS, PAPER_MAX_SHARES } from '../config/constants';
 // Track active arbitrage opportunities
 const activeArbs = new Map();
 /**
@@ -24,25 +13,25 @@ const activeArbs = new Map();
  * Uses /price endpoint which calculates actual executable prices
  * accounting for Polymarket's complement system (buy YES = sell NO)
  */
-async function fetchMarketPrices(market) {
+export async function fetchMarketPrices(market) {
     try {
         // Fetch execution prices for both Up and Down tokens
         // The /price endpoint accounts for complement trading
         const [upPriceResp, downPriceResp, upBook, downBook] = await Promise.all([
-            axios_1.default.get(`${constants_1.CLOB_API_URL}/price`, {
+            axios.get(`${CLOB_API_URL}/price`, {
                 params: { token_id: market.up_token_id, side: 'buy' },
                 timeout: 5000,
             }),
-            axios_1.default.get(`${constants_1.CLOB_API_URL}/price`, {
+            axios.get(`${CLOB_API_URL}/price`, {
                 params: { token_id: market.down_token_id, side: 'buy' },
                 timeout: 5000,
             }),
             // Also get orderbook for liquidity info
-            axios_1.default.get(`${constants_1.CLOB_API_URL}/book`, {
+            axios.get(`${CLOB_API_URL}/book`, {
                 params: { token_id: market.up_token_id },
                 timeout: 5000,
             }),
-            axios_1.default.get(`${constants_1.CLOB_API_URL}/book`, {
+            axios.get(`${CLOB_API_URL}/book`, {
                 params: { token_id: market.down_token_id },
                 timeout: 5000,
             }),
@@ -77,11 +66,11 @@ async function fetchMarketPrices(market) {
  *
  * Arb condition: up_price + down_price < 1.00 - MIN_EDGE
  */
-function checkArbitrage(market, prices) {
+export function checkArbitrage(market, prices) {
     const now = Date.now();
     const timeToExpiry = (market.expiry_timestamp - now) / 1000;
     // Skip if too close to expiry
-    if (timeToExpiry <= constants_1.EXPIRY_CUTOFF_SECONDS) {
+    if (timeToExpiry <= EXPIRY_CUTOFF_SECONDS) {
         return null;
     }
     // Skip if either side has zero liquidity
@@ -89,7 +78,7 @@ function checkArbitrage(market, prices) {
         return null;
     }
     const combinedCost = prices.up_price + prices.down_price;
-    const threshold = 1.0 - constants_1.MIN_EDGE;
+    const threshold = 1.0 - MIN_EDGE;
     // No arbitrage if combined cost >= threshold
     if (combinedCost >= threshold) {
         return null;
@@ -98,7 +87,7 @@ function checkArbitrage(market, prices) {
     const edge = 1.0 - combinedCost;
     const profitPerShare = edge;
     // Calculate executable shares (limited by liquidity and max)
-    const executableShares = Math.min(prices.up_shares_available, prices.down_shares_available, constants_1.PAPER_MAX_SHARES);
+    const executableShares = Math.min(prices.up_shares_available, prices.down_shares_available, PAPER_MAX_SHARES);
     const totalProfit = executableShares * profitPerShare;
     // Generate unique arb ID
     const arbId = `${market.id}-${now}`;
@@ -127,7 +116,7 @@ function checkArbitrage(market, prices) {
 /**
  * Update existing arbitrage tracking or create new
  */
-function updateArbTracking(marketId, newArb, prices) {
+export function updateArbTracking(marketId, newArb, prices) {
     const existing = activeArbs.get(marketId);
     // Case 1: No arb exists and none found
     if (!existing && !newArb) {
@@ -150,7 +139,7 @@ function updateArbTracking(marketId, newArb, prices) {
         }
         const now = Date.now();
         const timeToExpiry = (existing.expiry_timestamp - now) / 1000;
-        if (timeToExpiry <= constants_1.EXPIRY_CUTOFF_SECONDS) {
+        if (timeToExpiry <= EXPIRY_CUTOFF_SECONDS) {
             closeReason = 'expiry_cutoff';
         }
         return {
@@ -176,19 +165,19 @@ function updateArbTracking(marketId, newArb, prices) {
 /**
  * Get all active arbitrage opportunities
  */
-function getActiveArbs() {
+export function getActiveArbs() {
     return Array.from(activeArbs.values());
 }
 /**
  * Clear all tracked arbs
  */
-function clearArbs() {
+export function clearArbs() {
     activeArbs.clear();
 }
 /**
  * Get persistence duration in seconds
  */
-function getArbPersistence(arb) {
+export function getArbPersistence(arb) {
     return (arb.last_seen_at - arb.first_detected_at) / 1000;
 }
 //# sourceMappingURL=arbitrage.js.map

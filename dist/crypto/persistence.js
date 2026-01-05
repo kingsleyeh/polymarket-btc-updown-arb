@@ -1,21 +1,14 @@
-"use strict";
 /**
  * Persistence Tracking
  *
  * Tracks how long arbitrage opportunities persist before disappearing
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.recordClosedArb = recordClosedArb;
-exports.createActiveArbEntry = createActiveArbEntry;
-exports.getClosedArbs = getClosedArbs;
-exports.getPersistenceStats = getPersistenceStats;
-exports.clearPersistenceData = clearPersistenceData;
 // Track closed arbs for analysis
 const closedArbs = [];
 /**
  * Record a closed arbitrage opportunity
  */
-function recordClosedArb(arb, reason) {
+export function recordClosedArb(arb, reason) {
     const persistenceSec = (arb.last_seen_at - arb.first_detected_at) / 1000;
     const entry = {
         timestamp: new Date(arb.first_detected_at).toISOString(),
@@ -40,7 +33,7 @@ function recordClosedArb(arb, reason) {
 /**
  * Create entry for still-active arb (for final logging)
  */
-function createActiveArbEntry(arb) {
+export function createActiveArbEntry(arb) {
     const persistenceSec = (arb.last_seen_at - arb.first_detected_at) / 1000;
     return {
         timestamp: new Date(arb.first_detected_at).toISOString(),
@@ -63,13 +56,13 @@ function createActiveArbEntry(arb) {
 /**
  * Get all closed arbs
  */
-function getClosedArbs() {
+export function getClosedArbs() {
     return [...closedArbs];
 }
 /**
  * Get persistence statistics
  */
-function getPersistenceStats() {
+export function getPersistenceStats() {
     if (closedArbs.length === 0) {
         return {
             total_arbs: 0,
@@ -99,7 +92,7 @@ function getPersistenceStats() {
 /**
  * Clear persistence data
  */
-function clearPersistenceData() {
+export function clearPersistenceData() {
     closedArbs.length = 0;
 }
 //# sourceMappingURL=persistence.js.map

@@ -1,22 +1,12 @@
-"use strict";
 /**
  * Dashboard Web Server
  * BTC Up/Down Arbitrage Bot
  */
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.dashboardEvents = void 0;
-exports.pushLog = pushLog;
-exports.updateStats = updateStats;
-exports.getStats = getStats;
-exports.startDashboardServer = startDashboardServer;
-const express_1 = __importDefault(require("express"));
-const events_1 = require("events");
+import express from 'express';
+import { EventEmitter } from 'events';
 // Global event emitter for log streaming
-exports.dashboardEvents = new events_1.EventEmitter();
-exports.dashboardEvents.setMaxListeners(100);
+export const dashboardEvents = new EventEmitter();
+dashboardEvents.setMaxListeners(100);
 // Store recent logs
 const recentLogs = [];
 const MAX_LOGS = 500;
@@ -36,33 +26,33 @@ let stats = {
 /**
  * Push a log message
  */
-function pushLog(message) {
+export function pushLog(message) {
     const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
     const logLine = `[${timestamp}] ${message}`;
     recentLogs.push(logLine);
     if (recentLogs.length > MAX_LOGS) {
         recentLogs.shift();
     }
-    exports.dashboardEvents.emit('log', logLine);
+    dashboardEvents.emit('log', logLine);
 }
 /**
  * Update stats
  */
-function updateStats(update) {
+export function updateStats(update) {
     stats = { ...stats, ...update };
-    exports.dashboardEvents.emit('stats', stats);
+    dashboardEvents.emit('stats', stats);
 }
 /**
  * Get current stats
  */
-function getStats() {
+export function getStats() {
     return { ...stats };
 }
 /**
  * Start dashboard server
  */
-function startDashboardServer(port = 3000) {
-    const app = (0, express_1.default)();
+export function startDashboardServer(port = 3000) {
+    const app = express();
     app.get('/', (_req, res) => {
         res.send(getDashboardHTML());
     });
@@ -87,11 +77,11 @@ function startDashboardServer(port = 3000) {
         const onStats = (newStats) => {
             res.write(`event: stats\ndata: ${JSON.stringify(newStats)}\n\n`);
         };
-        exports.dashboardEvents.on('log', onLog);
-        exports.dashboardEvents.on('stats', onStats);
+        dashboardEvents.on('log', onLog);
+        dashboardEvents.on('stats', onStats);
         req.on('close', () => {
-            exports.dashboardEvents.off('log', onLog);
-            exports.dashboardEvents.off('stats', onStats);
+            dashboardEvents.off('log', onLog);
+            dashboardEvents.off('stats', onStats);
         });
     });
     app.listen(port, '0.0.0.0', () => {

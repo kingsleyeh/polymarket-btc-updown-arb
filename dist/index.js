@@ -1,4 +1,3 @@
-"use strict";
 /**
  * BTC Up/Down 15-Minute Arbitrage Bot
  *
@@ -7,47 +6,13 @@
  * Strategy: Buy BOTH Up + Down when combined cost < $0.98
  * Hold to expiry, collect $1 guaranteed
  */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
-Object.defineProperty(exports, "__esModule", { value: true });
-const dotenv = __importStar(require("dotenv"));
-const scanner_1 = require("./crypto/scanner");
-const arbitrage_1 = require("./crypto/arbitrage");
-const arb_logger_1 = require("./crypto/arb-logger");
-const server_1 = require("./dashboard/server");
-const trader_1 = require("./execution/trader");
-const constants_1 = require("./config/constants");
+import * as dotenv from 'dotenv';
+import { scanBTCUpDownMarkets, getMarketSummary } from './crypto/scanner';
+import { fetchMarketPrices, checkArbitrage, updateArbTracking } from './crypto/arbitrage';
+import { initializeLogFiles, incrementScanCount, incrementArbCount, getScanStats, resetStats, } from './crypto/arb-logger';
+import { startDashboardServer, pushLog, updateStats } from './dashboard/server';
+import { initializeTrader, executeTrade, getExecutionStats, isTraderReady } from './execution/trader';
+import { SCAN_INTERVAL_MS, MIN_EDGE, EXPIRY_CUTOFF_SECONDS } from './config/constants';
 // Load environment variables
 dotenv.config();
 // Trade size
@@ -56,7 +21,7 @@ const TRADE_SIZE_USD = 5;
 function log(message) {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] ${message}`);
-    (0, server_1.pushLog)(message);
+    pushLog(message);
 }
 /**
  * Main bot class
@@ -75,11 +40,11 @@ class BTCUpDownArbBot {
         log('Initializing BTC Up/Down Arbitrage Bot...');
         this.startTime = Date.now();
         // Reset stats for new session
-        (0, arb_logger_1.resetStats)();
-        (0, arb_logger_1.initializeLogFiles)();
+        resetStats();
+        initializeLogFiles();
         // Initialize trader with wallet
         log('Connecting to Polymarket...');
-        const traderReady = await (0, trader_1.initializeTrader)();
+        const traderReady = await initializeTrader();
         if (!traderReady) {
             log('ERROR: Failed to initialize trader - check POLYMARKET_PRIVATE_KEY');
             return false;
@@ -87,22 +52,22 @@ class BTCUpDownArbBot {
         log('✓ Wallet connected');
         // Initial market scan
         log('Scanning for BTC Up/Down 15-minute markets...');
-        this.markets = await (0, scanner_1.scanBTCUpDownMarkets)();
+        this.markets = await scanBTCUpDownMarkets();
         if (this.markets.length === 0) {
             log('⚠️ No BTC Up/Down markets found - will keep scanning');
         }
         else {
-            const summary = (0, scanner_1.getMarketSummary)(this.markets);
+            const summary = getMarketSummary(this.markets);
             log(`✓ Found ${summary.total} BTC Up/Down markets`);
             log(`  Time to expiry: ${Math.round(summary.avg_time_to_expiry / 60)} minutes`);
-            (0, server_1.updateStats)({
+            updateStats({
                 marketsCount: summary.total,
             });
         }
         log(`Mode: LIVE TRADING - $${TRADE_SIZE_USD} per trade`);
-        log(`Min edge: ${(constants_1.MIN_EDGE * 100).toFixed(1)}%`);
-        log(`Expiry cutoff: ${constants_1.EXPIRY_CUTOFF_SECONDS}s`);
-        log(`Scan interval: ${constants_1.SCAN_INTERVAL_MS}ms`);
+        log(`Min edge: ${(MIN_EDGE * 100).toFixed(1)}%`);
+        log(`Expiry cutoff: ${EXPIRY_CUTOFF_SECONDS}s`);
+        log(`Scan interval: ${SCAN_INTERVAL_MS}ms`);
         return true;
     }
     /**
@@ -115,17 +80,17 @@ class BTCUpDownArbBot {
         }
         log('🚀 Starting arbitrage scanner...');
         this.isRunning = true;
-        (0, server_1.updateStats)({
+        updateStats({
             status: 'running',
             startTime: this.startTime,
         });
         // Run initial scan
         await this.runScanCycle();
         // Start periodic scanning
-        this.scanInterval = setInterval(() => this.runScanCycle(), constants_1.SCAN_INTERVAL_MS);
+        this.scanInterval = setInterval(() => this.runScanCycle(), SCAN_INTERVAL_MS);
         // Refresh markets every 30 seconds
         setInterval(async () => {
-            this.markets = await (0, scanner_1.scanBTCUpDownMarkets)();
+            this.markets = await scanBTCUpDownMarkets();
             // Clear executed markets when new market window starts
             if (this.markets.length > 0) {
                 const currentMarketId = this.markets[0].id;
@@ -133,7 +98,7 @@ class BTCUpDownArbBot {
                     this.executedMarkets.clear();
                 }
             }
-            (0, server_1.updateStats)({ marketsCount: this.markets.length });
+            updateStats({ marketsCount: this.markets.length });
         }, 30 * 1000);
         log('✓ Bot is running - monitoring for arbitrage');
     }
@@ -141,7 +106,7 @@ class BTCUpDownArbBot {
      * Run a single scan cycle
      */
     async runScanCycle() {
-        if (!(0, trader_1.isTraderReady)()) {
+        if (!isTraderReady()) {
             return;
         }
         this.scanCount++;
@@ -150,7 +115,7 @@ class BTCUpDownArbBot {
         // Refresh markets if empty
         if (this.markets.length === 0) {
             if (this.scanCount % 5 === 0) {
-                this.markets = await (0, scanner_1.scanBTCUpDownMarkets)();
+                this.markets = await scanBTCUpDownMarkets();
             }
             if (this.markets.length === 0) {
                 if (this.scanCount % 20 === 0) {
@@ -167,7 +132,7 @@ class BTCUpDownArbBot {
             }
             try {
                 // Fetch current prices
-                const prices = await (0, arbitrage_1.fetchMarketPrices)(market);
+                const prices = await fetchMarketPrices(market);
                 if (!prices) {
                     continue;
                 }
@@ -178,23 +143,23 @@ class BTCUpDownArbBot {
                     bestCombined = combined;
                 }
                 // Check for arbitrage
-                const arb = (0, arbitrage_1.checkArbitrage)(market, prices);
+                const arb = checkArbitrage(market, prices);
                 if (arb) {
                     arbsThisCycle++;
-                    (0, arb_logger_1.incrementArbCount)();
+                    incrementArbCount();
                     const profit = (arb.edge * 100).toFixed(2);
                     const timeToExpiry = Math.round(arb.time_to_expiry_seconds / 60);
                     log(`🎯 ARB FOUND! ${market.question}`);
                     log(`   Up=$${prices.up_price.toFixed(3)} + Down=$${prices.down_price.toFixed(3)} = $${arb.combined_cost.toFixed(4)}`);
                     log(`   Edge: ${profit}% | Expiry in: ${timeToExpiry} minutes`);
                     // EXECUTE REAL TRADE
-                    const trade = await (0, trader_1.executeTrade)(arb);
+                    const trade = await executeTrade(arb);
                     if (trade && trade.status === 'filled') {
                         // Mark this market as executed to prevent duplicate trades
                         this.executedMarkets.add(market.id);
                         // Update dashboard
-                        const execStats = (0, trader_1.getExecutionStats)();
-                        (0, server_1.updateStats)({
+                        const execStats = getExecutionStats();
+                        updateStats({
                             arbsFound: execStats.total_trades,
                             totalProfit: execStats.total_profit,
                             totalCost: execStats.total_cost,
@@ -203,15 +168,15 @@ class BTCUpDownArbBot {
                     }
                 }
                 // Update tracking for data collection
-                (0, arbitrage_1.updateArbTracking)(market.id, arb, prices);
+                updateArbTracking(market.id, arb, prices);
             }
             catch (error) {
                 // Silent errors
             }
         }
         // Update stats
-        (0, arb_logger_1.incrementScanCount)(pricesChecked);
-        (0, server_1.updateStats)({
+        incrementScanCount(pricesChecked);
+        updateStats({
             scanCount: this.scanCount,
             lastScan: new Date().toISOString(),
         });
@@ -228,8 +193,8 @@ class BTCUpDownArbBot {
      */
     generateSessionReport() {
         const duration = (Date.now() - this.startTime) / (1000 * 60 * 60);
-        const stats = (0, arb_logger_1.getScanStats)();
-        const execStats = (0, trader_1.getExecutionStats)();
+        const stats = getScanStats();
+        const execStats = getExecutionStats();
         const lines = [
             '═══════════════════════════════════════════════════════════',
             '         BTC UP/DOWN ARBITRAGE REPORT',
@@ -274,25 +239,25 @@ class BTCUpDownArbBot {
 async function main() {
     // Start dashboard server
     const port = parseInt(process.env.PORT || '3000', 10);
-    (0, server_1.startDashboardServer)(port);
+    startDashboardServer(port);
     console.log('');
     log('═'.repeat(50));
     log('   BTC UP/DOWN 15-MIN ARBITRAGE BOT');
     log(`   LIVE TRADING - $${TRADE_SIZE_USD} per trade`);
     log('═'.repeat(50));
-    (0, server_1.updateStats)({ status: 'initializing' });
+    updateStats({ status: 'initializing' });
     const bot = new BTCUpDownArbBot();
     // Initialize
     const initialized = await bot.initialize();
     if (!initialized) {
         log('ERROR: Failed to initialize bot');
-        (0, server_1.updateStats)({ status: 'stopped' });
+        updateStats({ status: 'stopped' });
         process.exit(1);
     }
     // Handle graceful shutdown
     const shutdown = async (signal) => {
         log(`Received ${signal}, shutting down...`);
-        (0, server_1.updateStats)({ status: 'stopped' });
+        updateStats({ status: 'stopped' });
         await bot.stop();
         process.exit(0);
     };
