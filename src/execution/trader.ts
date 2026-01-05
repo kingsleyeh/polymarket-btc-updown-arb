@@ -15,7 +15,7 @@ import axios from 'axios';
 import { ArbitrageOpportunity } from '../types/arbitrage';
 
 // ============ CONFIGURATION ============
-const TRADE_SIZE_PERCENT = 0.20; // 20% of available balance per trade
+const TRADE_SIZE_PERCENT = 0.10; // 10% of available balance per trade
 const MIN_TRADE_SIZE_USD = 2; // Minimum $2 per trade
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
