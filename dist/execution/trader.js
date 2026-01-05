@@ -210,19 +210,33 @@ async function checkOrderStatus(orderId) {
         return 'unknown';
     try {
         const order = await clobClient.getOrder(orderId);
-        if (!order)
+        if (!order) {
+            // Order not found - might be filled and removed from system
             return 'unknown';
-        // Check order status
-        if (order.status === 'FILLED' || order.status === 'filled') {
+        }
+        // Check order status (case-insensitive)
+        const status = String(order.status || '').toLowerCase();
+        if (status === 'filled' || status === 'complete') {
             return 'filled';
         }
-        if (order.status === 'CANCELLED' || order.status === 'cancelled') {
+        if (status === 'cancelled' || status === 'canceled') {
             return 'cancelled';
+        }
+        // Check if order is partially filled (treat as filled for our purposes)
+        const orderAny = order;
+        const filledSize = parseFloat(orderAny.filledSize || orderAny.filled_size || '0');
+        const orderSize = parseFloat(orderAny.size || orderAny.orderSize || '0');
+        if (filledSize > 0 && orderSize > 0 && filledSize >= orderSize * 0.95) {
+            // 95%+ filled counts as filled
+            return 'filled';
         }
         return 'open';
     }
     catch (error) {
-        // If order not found, might be filled or cancelled
+        // If order not found (404), it might be filled and removed
+        if (error?.response?.status === 404) {
+            return 'unknown'; // Could be filled
+        }
         return 'unknown';
     }
 }
@@ -311,18 +325,33 @@ async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId,
     let secondLegOrderId = null;
     let marketOrderPlaced = false;
     // Fast polling loop
+    let checkCount = 0;
     while (Date.now() - startTime < ORDER_FILL_TIMEOUT_MS) {
+        checkCount++;
         // Check both orders in parallel
         if (!upFilled) {
             const upStatus = await checkOrderStatus(upOrderId);
             upFilled = upStatus === 'filled';
+            if (upFilled) {
+                console.log(`   ✓ UP order FILLED (check #${checkCount})`);
+            }
+            else if (upStatus !== 'open' && checkCount <= 3) {
+                console.log(`   ⚠️ UP order status: ${upStatus} (check #${checkCount})`);
+            }
         }
         if (!downFilled) {
             const downStatus = await checkOrderStatus(downOrderId);
             downFilled = downStatus === 'filled';
+            if (downFilled) {
+                console.log(`   ✓ DOWN order FILLED (check #${checkCount})`);
+            }
+            else if (downStatus !== 'open' && checkCount <= 3) {
+                console.log(`   ⚠️ DOWN order status: ${downStatus} (check #${checkCount})`);
+            }
         }
         // If both filled, we're done
         if (upFilled && downFilled) {
+            console.log(`   ✅ BOTH ORDERS FILLED after ${checkCount} checks`);
             return { upFilled: true, downFilled: true, secondLegOrderId: null, reversed: false };
         }
         // If one filled but other didn't - IMMEDIATELY place market order (no wait)
@@ -364,23 +393,27 @@ async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId,
         await new Promise(r => setTimeout(r, ORDER_CHECK_INTERVAL_MS));
     }
     // Final check after timeout
+    const elapsed = Date.now() - startTime;
+    console.log(`   ⏱️ Timeout reached (${(elapsed / 1000).toFixed(1)}s) - checking final status...`);
     if (!upFilled) {
         const upStatus = await checkOrderStatus(upOrderId);
         upFilled = upStatus === 'filled';
+        console.log(`   Final UP status: ${upStatus} (filled: ${upFilled})`);
     }
     if (!downFilled) {
         const downStatus = await checkOrderStatus(downOrderId);
         downFilled = downStatus === 'filled';
+        console.log(`   Final DOWN status: ${downStatus} (filled: ${downFilled})`);
     }
     // Check market order if we placed one
     if (secondLegOrderId) {
+        const secondStatus = await checkOrderStatus(secondLegOrderId);
+        console.log(`   Final second-leg status: ${secondStatus}`);
         if (upFilled && !downFilled) {
-            const downStatus = await checkOrderStatus(secondLegOrderId);
-            downFilled = downStatus === 'filled';
+            downFilled = secondStatus === 'filled';
         }
         else if (downFilled && !upFilled) {
-            const upStatus = await checkOrderStatus(secondLegOrderId);
-            upFilled = upStatus === 'filled';
+            upFilled = secondStatus === 'filled';
         }
     }
     // If still only one filled after all attempts, REVERSE the position

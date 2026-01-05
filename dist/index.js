@@ -32,7 +32,8 @@ class BTCUpDownArbBot {
     markets = [];
     scanCount = 0;
     startTime = Date.now();
-    executedMarkets = new Set(); // Prevent duplicate trades
+    executedMarkets = new Set(); // Markets we've successfully traded
+    tradingMarkets = new Set(); // Markets currently being traded (lock)
     /**
      * Initialize the bot
      */
@@ -145,6 +146,13 @@ class BTCUpDownArbBot {
                 // Check for arbitrage
                 const arb = checkArbitrage(market, prices);
                 if (arb) {
+                    // Skip if already executed or currently trading
+                    if (this.executedMarkets.has(market.id)) {
+                        continue; // Already traded this market successfully
+                    }
+                    if (this.tradingMarkets.has(market.id)) {
+                        continue; // Already trading this market - skip to prevent duplicates
+                    }
                     arbsThisCycle++;
                     incrementArbCount();
                     const profit = (arb.edge * 100).toFixed(2);
@@ -152,8 +160,12 @@ class BTCUpDownArbBot {
                     log(`🎯 ARB FOUND! ${market.question}`);
                     log(`   Up=$${prices.up_price.toFixed(3)} + Down=$${prices.down_price.toFixed(3)} = $${arb.combined_cost.toFixed(4)}`);
                     log(`   Edge: ${profit}% | Expiry in: ${timeToExpiry} minutes`);
+                    // Mark as trading IMMEDIATELY to prevent duplicate attempts
+                    this.tradingMarkets.add(market.id);
                     // EXECUTE REAL TRADE
                     const trade = await executeTrade(arb);
+                    // Remove from trading set (done trading, success or failure)
+                    this.tradingMarkets.delete(market.id);
                     if (trade) {
                         if (trade.status === 'filled') {
                             // Mark this market as executed to prevent duplicate trades
@@ -161,8 +173,8 @@ class BTCUpDownArbBot {
                             log(`✅ Trade successful - Market marked as executed`);
                         }
                         else {
-                            // Trade failed or partial - don't mark as executed, can try again
-                            log(`⚠️ Trade ${trade.status} - Will retry if arb persists`);
+                            // Trade failed or partial - don't mark as executed, can try again later
+                            log(`⚠️ Trade ${trade.status} - Can retry later if arb persists`);
                         }
                         // Update dashboard
                         const execStats = getExecutionStats();

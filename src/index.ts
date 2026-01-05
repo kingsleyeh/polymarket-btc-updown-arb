@@ -47,7 +47,8 @@ class BTCUpDownArbBot {
   private markets: UpDownMarket[] = [];
   private scanCount: number = 0;
   private startTime: number = Date.now();
-  private executedMarkets: Set<string> = new Set(); // Prevent duplicate trades
+  private executedMarkets: Set<string> = new Set(); // Markets we've successfully traded
+  private tradingMarkets: Set<string> = new Set(); // Markets currently being traded (lock)
 
   /**
    * Initialize the bot
@@ -190,6 +191,15 @@ class BTCUpDownArbBot {
         const arb = checkArbitrage(market, prices);
 
         if (arb) {
+          // Skip if already executed or currently trading
+          if (this.executedMarkets.has(market.id)) {
+            continue; // Already traded this market successfully
+          }
+          
+          if (this.tradingMarkets.has(market.id)) {
+            continue; // Already trading this market - skip to prevent duplicates
+          }
+
           arbsThisCycle++;
           incrementArbCount();
 
@@ -200,8 +210,14 @@ class BTCUpDownArbBot {
           log(`   Up=$${prices.up_price.toFixed(3)} + Down=$${prices.down_price.toFixed(3)} = $${arb.combined_cost.toFixed(4)}`);
           log(`   Edge: ${profit}% | Expiry in: ${timeToExpiry} minutes`);
 
+          // Mark as trading IMMEDIATELY to prevent duplicate attempts
+          this.tradingMarkets.add(market.id);
+
           // EXECUTE REAL TRADE
           const trade = await executeTrade(arb);
+          
+          // Remove from trading set (done trading, success or failure)
+          this.tradingMarkets.delete(market.id);
           
           if (trade) {
             if (trade.status === 'filled') {
@@ -210,8 +226,8 @@ class BTCUpDownArbBot {
               
               log(`✅ Trade successful - Market marked as executed`);
             } else {
-              // Trade failed or partial - don't mark as executed, can try again
-              log(`⚠️ Trade ${trade.status} - Will retry if arb persists`);
+              // Trade failed or partial - don't mark as executed, can try again later
+              log(`⚠️ Trade ${trade.status} - Can retry later if arb persists`);
             }
             
             // Update dashboard
