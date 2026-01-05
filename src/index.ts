@@ -216,20 +216,29 @@ class BTCUpDownArbBot {
           // EXECUTE REAL TRADE
           const trade = await executeTrade(arb);
           
-          // Remove from trading set (done trading, success or failure)
+          // CRITICAL: Mark as executed ONLY if orders were actually placed
+          // This ensures we only trade each market ONCE ($5 exposure rule)
+          // If orders failed to place (null trade or no order IDs), don't mark as executed
+          if (trade && trade.up_order_id && trade.down_order_id) {
+            // Orders were placed - mark as executed to prevent retries
+            this.executedMarkets.add(market.id);
+            log(`✅ Orders placed - Market marked as executed (maintains $5 exposure rule)`);
+            
+            if (trade.status === 'filled') {
+              log(`   ✅ Both legs completed successfully`);
+            } else {
+              log(`   ⚠️ Trade status: ${trade.status} - Position monitoring in progress`);
+            }
+          } else {
+            // Orders were NOT placed (rejected before submission or submission failed)
+            // Don't mark as executed - can try again if arb persists
+            log(`⚠️ Orders not placed - Can retry if arb persists`);
+          }
+          
+          // Remove from trading set (done processing this attempt)
           this.tradingMarkets.delete(market.id);
           
           if (trade) {
-            if (trade.status === 'filled') {
-              // Mark this market as executed to prevent duplicate trades
-              this.executedMarkets.add(market.id);
-              
-              log(`✅ Trade successful - Market marked as executed`);
-            } else {
-              // Trade failed or partial - don't mark as executed, can try again later
-              log(`⚠️ Trade ${trade.status} - Can retry later if arb persists`);
-            }
-            
             // Update dashboard
             const execStats = getExecutionStats();
             updateStats({
