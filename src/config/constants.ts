@@ -9,7 +9,7 @@ export const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 
 // Arbitrage Settings
 export const MIN_EDGE = 0.02; // 2% minimum edge
-export const EXPIRY_CUTOFF_SECONDS = 120; // Ignore last 2 minutes before expiry
+export const EXPIRY_CUTOFF_SECONDS = 180; // Ignore last 3 minutes before expiry
 export const PAPER_MAX_SHARES = 100; // Max shares per paper trade
 
 // Scan Settings
