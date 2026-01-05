@@ -698,22 +698,53 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     return null;
   }
   
-  // Use VERY aggressive limits (20% above current) to ensure immediate fills
-  // This acts like a true market order - will fill immediately if liquidity exists
-  const AGGRESSIVE_SLIPPAGE = 0.20; // 20% - ensures immediate fill
-  const upMarketPrice = Math.min(freshUpPrice * (1 + AGGRESSIVE_SLIPPAGE), 0.99);
-  const downMarketPrice = Math.min(freshDownPrice * (1 + AGGRESSIVE_SLIPPAGE), 0.99);
-  const maxCombinedCost = upMarketPrice + downMarketPrice;
+  const freshCombined = freshUpPrice + freshDownPrice;
+  
+  // If fresh prices already exceed our limit, arb is gone
+  if (freshCombined >= MAX_COMBINED_COST) {
+    console.log(`   ❌ Fresh prices already at $${freshCombined.toFixed(4)} - arb disappeared`);
+    return null;
+  }
+  
+  // Calculate market prices with smart buffer
+  // If fresh prices are already high, use smaller buffer to ensure we stay under $0.99
+  const roomForBuffer = MAX_COMBINED_COST - freshCombined;
+  
+  let upMarketPrice: number;
+  let downMarketPrice: number;
+  
+  if (roomForBuffer > 0.05) {
+    // Plenty of room - use 5% buffer per leg for aggressive fills
+    upMarketPrice = Math.min(freshUpPrice * 1.05, 0.99);
+    downMarketPrice = Math.min(freshDownPrice * 1.05, 0.99);
+  } else if (roomForBuffer > 0.02) {
+    // Some room - use 2% buffer per leg
+    upMarketPrice = Math.min(freshUpPrice * 1.02, 0.99);
+    downMarketPrice = Math.min(freshDownPrice * 1.02, 0.99);
+  } else {
+    // Very little room - use fresh prices directly (should still fill if liquidity exists)
+    upMarketPrice = freshUpPrice;
+    downMarketPrice = freshDownPrice;
+  }
+  
+  let maxCombinedCost = upMarketPrice + downMarketPrice;
 
-  // Final safety check - ensure max combined cost is acceptable
+  // If still exceeds, scale down proportionally
+  if (maxCombinedCost > MAX_COMBINED_COST) {
+    const scaleFactor = MAX_COMBINED_COST / maxCombinedCost;
+    upMarketPrice = upMarketPrice * scaleFactor;
+    downMarketPrice = downMarketPrice * scaleFactor;
+    maxCombinedCost = upMarketPrice + downMarketPrice;
+  }
+
+  // Final safety check
   if (maxCombinedCost > MAX_COMBINED_COST) {
     console.log(`   ❌ Max combined cost $${maxCombinedCost.toFixed(4)} exceeds limit $${MAX_COMBINED_COST.toFixed(2)} - rejecting`);
     return null;
   }
 
-  console.log(`   Fresh prices: UP=$${freshUpPrice.toFixed(3)} DOWN=$${freshDownPrice.toFixed(3)}`);
-  console.log(`   Market orders: UP=$${upMarketPrice.toFixed(3)} DOWN=$${downMarketPrice.toFixed(3)} (20% buffer)`);
-  console.log(`   Max combined: $${maxCombinedCost.toFixed(4)}`);
+  console.log(`   Fresh prices: UP=$${freshUpPrice.toFixed(3)} DOWN=$${freshDownPrice.toFixed(3)} = $${(freshUpPrice + freshDownPrice).toFixed(4)}`);
+  console.log(`   Market orders: UP=$${upMarketPrice.toFixed(3)} DOWN=$${downMarketPrice.toFixed(3)} = $${maxCombinedCost.toFixed(4)}`);
 
   try {
     // Place BOTH orders simultaneously with TRUE MARKET prices (20% buffer)
