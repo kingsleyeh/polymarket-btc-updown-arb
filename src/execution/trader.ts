@@ -16,7 +16,6 @@ import { ArbitrageOpportunity } from '../types/arbitrage';
 
 // ============ CONFIGURATION ============
 const TRADE_SIZE_PERCENT = 0.20; // 20% of available balance per trade
-const MAX_TRADE_SIZE_USD = 50; // Cap at $50 per trade
 const MIN_TRADE_SIZE_USD = 2; // Minimum $2 per trade
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
 const SLIPPAGE_TOLERANCE = 0.005; // 0.5% slippage tolerance on price
@@ -95,7 +94,6 @@ export async function initializeTrader(): Promise<boolean> {
     
     console.log(`\n📊 SIZING CONFIG:`);
     console.log(`   Trade size: ${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of balance`);
-    console.log(`   Max per trade: $${MAX_TRADE_SIZE_USD}`);
     console.log(`   Min per trade: $${MIN_TRADE_SIZE_USD}`);
     console.log(`   Max liquidity take: ${(MAX_LIQUIDITY_PERCENT * 100).toFixed(0)}%`);
     console.log(`   Slippage tolerance: ${(SLIPPAGE_TOLERANCE * 100).toFixed(1)}%`);
@@ -238,13 +236,7 @@ function calculateTradeSize(
 ): { shares: number; reason: string } {
   // Start with % of balance
   let targetUsd = balance * TRADE_SIZE_PERCENT;
-  let reason = `${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of balance`;
-
-  // Cap at max
-  if (targetUsd > MAX_TRADE_SIZE_USD) {
-    targetUsd = MAX_TRADE_SIZE_USD;
-    reason = `capped at max $${MAX_TRADE_SIZE_USD}`;
-  }
+  let reason = `${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of $${balance.toFixed(2)} balance`;
 
   // Floor at min
   if (targetUsd < MIN_TRADE_SIZE_USD) {
