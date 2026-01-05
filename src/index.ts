@@ -203,9 +203,16 @@ class BTCUpDownArbBot {
           // EXECUTE REAL TRADE
           const trade = await executeTrade(arb);
           
-          if (trade && trade.status === 'filled') {
-            // Mark this market as executed to prevent duplicate trades
-            this.executedMarkets.add(market.id);
+          if (trade) {
+            if (trade.status === 'filled') {
+              // Mark this market as executed to prevent duplicate trades
+              this.executedMarkets.add(market.id);
+              
+              log(`✅ Trade successful - Market marked as executed`);
+            } else {
+              // Trade failed or partial - don't mark as executed, can try again
+              log(`⚠️ Trade ${trade.status} - Will retry if arb persists`);
+            }
             
             // Update dashboard
             const execStats = getExecutionStats();

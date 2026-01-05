@@ -18,8 +18,10 @@ import { ArbitrageOpportunity } from '../types/arbitrage';
 const TRADE_SIZE_PERCENT = 0.20; // 20% of available balance per trade
 const MIN_TRADE_SIZE_USD = 2; // Minimum $2 per trade
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
-const SLIPPAGE_TOLERANCE = 0.005; // 0.5% slippage tolerance on price
+const SLIPPAGE_TOLERANCE = 0.01; // 1% slippage tolerance - more aggressive to ensure fills
 const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
+const ORDER_FILL_TIMEOUT_MS = 5000; // 5 seconds to wait for both orders to fill
+const ORDER_CHECK_INTERVAL_MS = 500; // Check order status every 500ms
 
 // Polymarket
 const CHAIN_ID = 137;
@@ -265,6 +267,131 @@ function calculateTradeSize(
 }
 
 /**
+ * Check if an order is filled
+ */
+async function checkOrderStatus(orderId: string): Promise<'filled' | 'open' | 'cancelled' | 'unknown'> {
+  if (!clobClient) return 'unknown';
+  
+  try {
+    const order = await clobClient.getOrder(orderId);
+    if (!order) return 'unknown';
+    
+    // Check order status
+    if (order.status === 'FILLED' || order.status === 'filled') {
+      return 'filled';
+    }
+    if (order.status === 'CANCELLED' || order.status === 'cancelled') {
+      return 'cancelled';
+    }
+    return 'open';
+  } catch (error: any) {
+    // If order not found, might be filled or cancelled
+    return 'unknown';
+  }
+}
+
+/**
+ * Cancel an order
+ */
+async function cancelOrder(orderId: string): Promise<boolean> {
+  if (!clobClient) return false;
+  
+  try {
+    await clobClient.cancelOrder(orderId);
+    return true;
+  } catch (error: any) {
+    console.error(`   Failed to cancel order ${orderId}: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Wait for both orders to fill, cancel if one doesn't
+ */
+async function waitForBothOrders(
+  upOrderId: string | null,
+  downOrderId: string | null
+): Promise<{ upFilled: boolean; downFilled: boolean }> {
+  if (!upOrderId || !downOrderId) {
+    return { upFilled: false, downFilled: false };
+  }
+
+  const startTime = Date.now();
+  let upFilled = false;
+  let downFilled = false;
+
+  while (Date.now() - startTime < ORDER_FILL_TIMEOUT_MS) {
+    // Check both orders in parallel
+    if (!upFilled) {
+      const upStatus = await checkOrderStatus(upOrderId);
+      upFilled = upStatus === 'filled';
+    }
+
+    if (!downFilled) {
+      const downStatus = await checkOrderStatus(downOrderId);
+      downFilled = downStatus === 'filled';
+    }
+
+    // If both filled, we're done
+    if (upFilled && downFilled) {
+      return { upFilled: true, downFilled: true };
+    }
+
+    // If one filled but other didn't, wait a bit more then cancel
+    if ((upFilled && !downFilled) || (!upFilled && downFilled)) {
+      await new Promise(r => setTimeout(r, ORDER_CHECK_INTERVAL_MS));
+      
+      // Check one more time
+      if (!upFilled) {
+        const upStatus = await checkOrderStatus(upOrderId);
+        upFilled = upStatus === 'filled';
+      }
+      if (!downFilled) {
+        const downStatus = await checkOrderStatus(downOrderId);
+        downFilled = downStatus === 'filled';
+      }
+
+      // If still only one filled, cancel the other
+      if (upFilled && !downFilled) {
+        console.log(`   ⚠️ UP filled but DOWN didn't - cancelling DOWN order...`);
+        await cancelOrder(downOrderId);
+        return { upFilled: true, downFilled: false };
+      }
+      if (downFilled && !upFilled) {
+        console.log(`   ⚠️ DOWN filled but UP didn't - cancelling UP order...`);
+        await cancelOrder(upOrderId);
+        return { upFilled: false, downFilled: true };
+      }
+    }
+
+    // Wait before next check
+    await new Promise(r => setTimeout(r, ORDER_CHECK_INTERVAL_MS));
+  }
+
+  // Timeout - check final status
+  if (!upFilled) {
+    const upStatus = await checkOrderStatus(upOrderId);
+    upFilled = upStatus === 'filled';
+  }
+  if (!downFilled) {
+    const downStatus = await checkOrderStatus(downOrderId);
+    downFilled = downStatus === 'filled';
+  }
+
+  // Cancel any unfilled orders
+  if (!upFilled && upOrderId) {
+    console.log(`   ⚠️ UP order didn't fill - cancelling...`);
+    await cancelOrder(upOrderId);
+  }
+  if (!downFilled && downOrderId) {
+    console.log(`   ⚠️ DOWN order didn't fill - cancelling...`);
+    await cancelOrder(downOrderId);
+  }
+
+  return { upFilled, downFilled };
+}
+
+/**
  * Execute arbitrage trade - buy both Up and Down in PARALLEL
  */
 export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null> {
@@ -339,12 +466,15 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
   console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
   console.log(`   Cost: $${costUsd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
 
-  // Step 4: Execute BOTH orders in PARALLEL
+  // Step 4: Execute BOTH orders in PARALLEL with aggressive pricing
   console.log(`   Submitting orders in parallel...`);
   
-  // Add slippage to ensure fill
+  // Use more aggressive slippage to ensure fills
   const upPriceWithSlippage = Math.min(upPrice * (1 + SLIPPAGE_TOLERANCE), 0.99);
   const downPriceWithSlippage = Math.min(downPrice * (1 + SLIPPAGE_TOLERANCE), 0.99);
+
+  console.log(`   UP limit: $${upPriceWithSlippage.toFixed(3)} (${((upPriceWithSlippage / upPrice - 1) * 100).toFixed(1)}% slippage)`);
+  console.log(`   DOWN limit: $${downPriceWithSlippage.toFixed(3)} (${((downPriceWithSlippage / downPrice - 1) * 100).toFixed(1)}% slippage)`);
 
   try {
     const [upResult, downResult] = await Promise.all([
@@ -362,47 +492,56 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
       }).catch(err => ({ error: err })),
     ]);
 
-    // Check results
-    const upSuccess = upResult && !('error' in upResult) && upResult.orderID;
-    const downSuccess = downResult && !('error' in downResult) && downResult.orderID;
+    // Check if orders were submitted
+    const upOrderId = upResult && !('error' in upResult) ? (upResult as any).orderID : null;
+    const downOrderId = downResult && !('error' in downResult) ? (downResult as any).orderID : null;
 
-    if (upSuccess) {
-      trade.up_order_id = (upResult as any).orderID;
-      console.log(`   ✓ UP order: ${trade.up_order_id}`);
-    } else {
-      const errMsg = ('error' in upResult) ? (upResult.error as any).message : 'No order ID';
-      console.error(`   ❌ UP order failed: ${errMsg}`);
+    if (!upOrderId || !downOrderId) {
+      // One or both orders failed to submit
+      const upErr = ('error' in upResult) ? (upResult.error as any).message : 'No order ID';
+      const downErr = ('error' in downResult) ? (downResult.error as any).message : 'No order ID';
+      
+      if (!upOrderId) console.error(`   ❌ UP order submission failed: ${upErr}`);
+      if (!downOrderId) console.error(`   ❌ DOWN order submission failed: ${downErr}`);
+      
+      trade.status = 'failed';
+      trade.error = `Order submission failed: UP=${upOrderId ? 'ok' : 'failed'}, DOWN=${downOrderId ? 'ok' : 'failed'}`;
+      console.log(`   ❌ TRADE FAILED - Could not submit both orders`);
+      executedTrades.push(trade);
+      return trade;
     }
 
-    if (downSuccess) {
-      trade.down_order_id = (downResult as any).orderID;
-      console.log(`   ✓ DOWN order: ${trade.down_order_id}`);
-    } else {
-      const errMsg = ('error' in downResult) ? (downResult.error as any).message : 'No order ID';
-      console.error(`   ❌ DOWN order failed: ${errMsg}`);
-    }
+    trade.up_order_id = upOrderId;
+    trade.down_order_id = downOrderId;
+    console.log(`   ✓ UP order submitted: ${upOrderId}`);
+    console.log(`   ✓ DOWN order submitted: ${downOrderId}`);
+    console.log(`   ⏳ Waiting for both orders to fill (max ${ORDER_FILL_TIMEOUT_MS / 1000}s)...`);
 
-    // Determine trade status
-    if (upSuccess && downSuccess) {
+    // Wait for both orders to fill, cancel if only one fills
+    const { upFilled, downFilled } = await waitForBothOrders(upOrderId, downOrderId);
+
+    // Determine final status
+    if (upFilled && downFilled) {
       trade.status = 'filled';
-      console.log(`   ✅ TRADE COMPLETE - Profit locked: $${profitUsd.toFixed(2)}`);
+      console.log(`   ✅ BOTH ORDERS FILLED - Profit locked: $${profitUsd.toFixed(2)}`);
       
       // Update balance cache
       cachedBalance -= costUsd;
       console.log(`   💵 Remaining balance: ~$${cachedBalance.toFixed(2)}`);
-    } else if (upSuccess || downSuccess) {
-      trade.status = 'partial';
-      console.log(`   ⚠️ PARTIAL FILL - One side failed`);
+      console.log(`   📊 Continuing to scan for more opportunities...\n`);
     } else {
+      // Partial fill - we cancelled the other order
       trade.status = 'failed';
-      trade.error = 'Both orders failed';
-      console.log(`   ❌ TRADE FAILED - Both orders rejected`);
+      trade.error = `Partial fill - UP=${upFilled ? 'filled' : 'cancelled'}, DOWN=${downFilled ? 'filled' : 'cancelled'}`;
+      console.log(`   ❌ TRADE CANCELLED - Only one side filled, cancelled the other to avoid exposure`);
+      console.log(`   📊 Continuing to scan for more opportunities...\n`);
     }
 
   } catch (error: any) {
     trade.status = 'failed';
     trade.error = error.message;
     console.error(`   ❌ TRADE FAILED: ${error.message}`);
+    console.log(`   📊 Continuing to scan for more opportunities...\n`);
   }
 
   executedTrades.push(trade);
