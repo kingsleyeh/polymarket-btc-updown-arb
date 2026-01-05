@@ -16,14 +16,16 @@ import { ArbitrageOpportunity } from '../types/arbitrage';
 
 // ============ CONFIGURATION ============
 const TRADE_SIZE_PERCENT = 0.10; // 10% of available balance per trade
-const MIN_TRADE_SIZE_USD = 2; // Minimum $2 per trade
+const MIN_TRADE_SIZE_USD = 5; // Minimum $5 per trade (to meet Polymarket's 5 share minimum)
+const MIN_SHARES = 5; // Polymarket requires minimum 5 shares per order
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
 const MARKET_ORDER_SLIPPAGE = 0.02; // 2% - use aggressive limit prices that act like market orders
 const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
-const ORDER_FILL_TIMEOUT_MS = 3000; // 3 seconds to wait for both orders to fill
-const ORDER_CHECK_INTERVAL_MS = 200; // Check order status every 200ms
-const SECOND_LEG_TIMEOUT_MS = 2000; // If one fills, wait 2s for other, then market order
+const ORDER_FILL_TIMEOUT_MS = 2000; // 2 seconds to wait for both orders to fill
+const ORDER_CHECK_INTERVAL_MS = 100; // Check order status every 100ms (faster)
+const SECOND_LEG_TIMEOUT_MS = 500; // If one fills, wait 500ms for other, then IMMEDIATELY market order
+const REVERSE_TIMEOUT_MS = 3000; // If can't complete pair in 3s, reverse the filled leg
 
 // Polymarket
 const CHAIN_ID = 137;
@@ -240,13 +242,23 @@ function calculateTradeSize(
   let targetUsd = balance * TRADE_SIZE_PERCENT;
   let reason = `${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of $${balance.toFixed(2)} balance`;
 
-  // Floor at min
+  // Floor at min USD
   if (targetUsd < MIN_TRADE_SIZE_USD) {
     return { shares: 0, reason: `below min $${MIN_TRADE_SIZE_USD}` };
   }
 
   // Calculate shares from USD
   let shares = Math.floor(targetUsd / combinedCost);
+  
+  // Enforce Polymarket's minimum 5 shares requirement
+  if (shares < MIN_SHARES) {
+    // Check if we can afford minimum 5 shares
+    const minCost = MIN_SHARES * combinedCost;
+    if (minCost > balance) {
+      return { shares: 0, reason: `cannot afford minimum ${MIN_SHARES} shares (need $${minCost.toFixed(2)})` };
+    }
+    shares = MIN_SHARES;
+  }
 
   // Respect liquidity - don't take more than MAX_LIQUIDITY_PERCENT of available
   const maxUpShares = Math.floor(upLiquidity * MAX_LIQUIDITY_PERCENT);
@@ -333,7 +345,50 @@ async function placeMarketOrder(
 }
 
 /**
- * Wait for both orders to fill, place market order for second leg if one fills
+ * Sell/close a position immediately (reverse the filled leg)
+ */
+async function reversePosition(
+  tokenId: string,
+  shares: number
+): Promise<boolean> {
+  if (!clobClient) return false;
+  
+  try {
+    // Get current price to sell at market
+    const priceResp = await axios.get(`${CLOB_HOST}/price`, {
+      params: { token_id: tokenId, side: 'sell' },
+      timeout: 1000,
+    });
+    
+    const sellPrice = parseFloat(priceResp.data?.price || '0');
+    if (sellPrice === 0) return false;
+    
+    // Use aggressive limit (slightly below market) to ensure immediate fill
+    const limitPrice = Math.max(sellPrice * 0.98, 0.01); // 2% below market, min $0.01
+    
+    console.log(`   🔄 Reversing position: selling ${shares} shares @ $${limitPrice.toFixed(3)}...`);
+    
+    const order = await clobClient.createAndPostOrder({
+      tokenID: tokenId,
+      price: limitPrice,
+      size: shares,
+      side: Side.SELL,
+    });
+    
+    if (order.orderID) {
+      console.log(`   ✓ Reversal order placed: ${order.orderID}`);
+      return true;
+    }
+    return false;
+  } catch (error: any) {
+    console.error(`   ❌ Failed to reverse position: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Wait for both orders to fill, IMMEDIATELY place market order for second leg if one fills
+ * If can't complete pair, reverse the filled leg to close position
  */
 async function waitForBothOrders(
   upOrderId: string | null,
@@ -343,16 +398,18 @@ async function waitForBothOrders(
   shares: number,
   maxUpPrice: number,
   maxDownPrice: number
-): Promise<{ upFilled: boolean; downFilled: boolean; secondLegOrderId: string | null }> {
+): Promise<{ upFilled: boolean; downFilled: boolean; secondLegOrderId: string | null; reversed: boolean }> {
   if (!upOrderId || !downOrderId) {
-    return { upFilled: false, downFilled: false, secondLegOrderId: null };
+    return { upFilled: false, downFilled: false, secondLegOrderId: null, reversed: false };
   }
 
   const startTime = Date.now();
   let upFilled = false;
   let downFilled = false;
   let secondLegOrderId: string | null = null;
+  let marketOrderPlaced = false;
 
+  // Fast polling loop
   while (Date.now() - startTime < ORDER_FILL_TIMEOUT_MS) {
     // Check both orders in parallel
     if (!upFilled) {
@@ -367,40 +424,42 @@ async function waitForBothOrders(
 
     // If both filled, we're done
     if (upFilled && downFilled) {
-      return { upFilled: true, downFilled: true, secondLegOrderId: null };
+      return { upFilled: true, downFilled: true, secondLegOrderId: null, reversed: false };
     }
 
-    // If one filled but other didn't, wait a bit then place market order for second leg
+    // If one filled but other didn't - IMMEDIATELY place market order (no wait)
     if ((upFilled && !downFilled) || (!upFilled && downFilled)) {
-      const waitTime = Date.now() - startTime;
-      
-      if (waitTime >= SECOND_LEG_TIMEOUT_MS) {
-        // Time to place market order for the unfilled leg
+      if (!marketOrderPlaced) {
+        marketOrderPlaced = true;
+        
         if (upFilled && !downFilled) {
-          console.log(`   ⚠️ UP filled but DOWN didn't - placing MARKET order for DOWN leg...`);
+          console.log(`   ⚠️ UP filled but DOWN didn't - IMMEDIATELY placing MARKET order for DOWN...`);
           secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
           if (secondLegOrderId) {
             console.log(`   ✓ Market order placed for DOWN: ${secondLegOrderId}`);
-            // Wait a moment for market order to fill
-            await new Promise(r => setTimeout(r, 1000));
-            const downStatus = await checkOrderStatus(secondLegOrderId);
-            downFilled = downStatus === 'filled';
           }
         } else if (downFilled && !upFilled) {
-          console.log(`   ⚠️ DOWN filled but UP didn't - placing MARKET order for UP leg...`);
+          console.log(`   ⚠️ DOWN filled but UP didn't - IMMEDIATELY placing MARKET order for UP...`);
           secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
           if (secondLegOrderId) {
             console.log(`   ✓ Market order placed for UP: ${secondLegOrderId}`);
-            // Wait a moment for market order to fill
-            await new Promise(r => setTimeout(r, 1000));
-            const upStatus = await checkOrderStatus(secondLegOrderId);
-            upFilled = upStatus === 'filled';
           }
         }
+      }
+      
+      // If we placed market order, check if it filled
+      if (secondLegOrderId) {
+        if (upFilled && !downFilled) {
+          const downStatus = await checkOrderStatus(secondLegOrderId);
+          downFilled = downStatus === 'filled';
+        } else if (downFilled && !upFilled) {
+          const upStatus = await checkOrderStatus(secondLegOrderId);
+          upFilled = upStatus === 'filled';
+        }
         
-        // If we placed market order, return result
-        if (secondLegOrderId) {
-          return { upFilled, downFilled, secondLegOrderId };
+        // If both filled now, we're done
+        if (upFilled && downFilled) {
+          return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
         }
       }
     }
@@ -418,37 +477,58 @@ async function waitForBothOrders(
     const downStatus = await checkOrderStatus(downOrderId);
     downFilled = downStatus === 'filled';
   }
-
-  // If still only one filled, place market order for the other
-  if (upFilled && !downFilled && !secondLegOrderId) {
-    console.log(`   ⚠️ Timeout - UP filled but DOWN didn't - placing MARKET order for DOWN...`);
-    secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
-    if (secondLegOrderId) {
-      await new Promise(r => setTimeout(r, 1000));
+  
+  // Check market order if we placed one
+  if (secondLegOrderId) {
+    if (upFilled && !downFilled) {
       const downStatus = await checkOrderStatus(secondLegOrderId);
       downFilled = downStatus === 'filled';
-    }
-  } else if (downFilled && !upFilled && !secondLegOrderId) {
-    console.log(`   ⚠️ Timeout - DOWN filled but UP didn't - placing MARKET order for UP...`);
-    secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
-    if (secondLegOrderId) {
-      await new Promise(r => setTimeout(r, 1000));
+    } else if (downFilled && !upFilled) {
       const upStatus = await checkOrderStatus(secondLegOrderId);
       upFilled = upStatus === 'filled';
     }
   }
 
-  // Cancel original unfilled orders if we placed market orders
-  if (secondLegOrderId) {
-    if (!upFilled && upOrderId) {
-      await cancelOrder(upOrderId);
-    }
-    if (!downFilled && downOrderId) {
-      await cancelOrder(downOrderId);
+  // If still only one filled after all attempts, REVERSE the position
+  if ((upFilled && !downFilled) || (downFilled && !upFilled)) {
+    const totalTime = Date.now() - startTime;
+    if (totalTime >= REVERSE_TIMEOUT_MS) {
+      console.log(`   ⚠️ Cannot complete pair after ${(totalTime / 1000).toFixed(1)}s - REVERSING position to avoid exposure...`);
+      
+      let reversed = false;
+      if (upFilled && !downFilled) {
+        // Cancel any pending orders
+        if (downOrderId) await cancelOrder(downOrderId);
+        if (secondLegOrderId) await cancelOrder(secondLegOrderId);
+        // Reverse UP position
+        reversed = await reversePosition(upTokenId, shares);
+      } else if (downFilled && !upFilled) {
+        // Cancel any pending orders
+        if (upOrderId) await cancelOrder(upOrderId);
+        if (secondLegOrderId) await cancelOrder(secondLegOrderId);
+        // Reverse DOWN position
+        reversed = await reversePosition(downTokenId, shares);
+      }
+      
+      return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
     }
   }
 
-  return { upFilled, downFilled, secondLegOrderId };
+  // Cancel any unfilled orders
+  if (!upFilled && upOrderId) {
+    await cancelOrder(upOrderId);
+  }
+  if (!downFilled && downOrderId) {
+    await cancelOrder(downOrderId);
+  }
+  if (secondLegOrderId) {
+    const secondStatus = await checkOrderStatus(secondLegOrderId);
+    if (secondStatus !== 'filled') {
+      await cancelOrder(secondLegOrderId);
+    }
+  }
+
+  return { upFilled, downFilled, secondLegOrderId, reversed: false };
 }
 
 /**
@@ -574,15 +654,37 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     const downOrderId = downResult && !('error' in downResult) ? (downResult as any).orderID : null;
 
     if (!upOrderId || !downOrderId) {
-      // One or both orders failed to submit
-      const upErr = ('error' in upResult) ? (upResult.error as any).message : 'No order ID';
-      const downErr = ('error' in downResult) ? (downResult.error as any).message : 'No order ID';
+      // One or both orders failed to submit - extract error message
+      let upErr = 'Unknown error';
+      let downErr = 'Unknown error';
       
-      if (!upOrderId) console.error(`   ❌ UP order submission failed: ${upErr}`);
-      if (!downOrderId) console.error(`   ❌ DOWN order submission failed: ${downErr}`);
+      if ('error' in upResult) {
+        const err = upResult.error as any;
+        upErr = err?.data?.error || err?.message || err?.toString() || 'Unknown error';
+      }
+      
+      if ('error' in downResult) {
+        const err = downResult.error as any;
+        downErr = err?.data?.error || err?.message || err?.toString() || 'Unknown error';
+      }
+      
+      if (!upOrderId) {
+        console.error(`   ❌ UP order submission failed: ${upErr}`);
+        // Check if it's the minimum size error
+        if (upErr.includes('minimum') || upErr.includes('Size')) {
+          console.error(`   ⚠️  This is likely due to minimum 5 shares requirement`);
+        }
+      }
+      if (!downOrderId) {
+        console.error(`   ❌ DOWN order submission failed: ${downErr}`);
+        // Check if it's the minimum size error
+        if (downErr.includes('minimum') || downErr.includes('Size')) {
+          console.error(`   ⚠️  This is likely due to minimum 5 shares requirement`);
+        }
+      }
       
       trade.status = 'failed';
-      trade.error = `Order submission failed: UP=${upOrderId ? 'ok' : 'failed'}, DOWN=${downOrderId ? 'ok' : 'failed'}`;
+      trade.error = `Order submission failed: UP=${upOrderId ? 'ok' : upErr}, DOWN=${downOrderId ? 'ok' : downErr}`;
       console.log(`   ❌ TRADE FAILED - Could not submit both orders`);
       executedTrades.push(trade);
       return trade;
@@ -595,7 +697,7 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     console.log(`   ⏳ Waiting for both orders to fill (max ${ORDER_FILL_TIMEOUT_MS / 1000}s)...`);
 
     // Wait for both orders to fill, place market order for second leg if one fills
-    const { upFilled, downFilled, secondLegOrderId } = await waitForBothOrders(
+    const { upFilled, downFilled, secondLegOrderId, reversed } = await waitForBothOrders(
       upOrderId,
       downOrderId,
       arb.up_token_id,
@@ -615,7 +717,13 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     }
 
     // Determine final status
-    if (upFilled && downFilled) {
+    if (reversed) {
+      // Position was reversed to avoid exposure
+      trade.status = 'failed';
+      trade.error = 'Position reversed - could not complete pair';
+      console.log(`   ✅ POSITION REVERSED - Avoided directional exposure`);
+      console.log(`   📊 Continuing to scan for more opportunities...\n`);
+    } else if (upFilled && downFilled) {
       trade.status = 'filled';
       if (secondLegOrderId) {
         console.log(`   ✅ BOTH ORDERS FILLED (used market order for second leg) - Profit locked: $${profitUsd.toFixed(2)}`);
@@ -628,10 +736,10 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
       console.log(`   💵 Remaining balance: ~$${cachedBalance.toFixed(2)}`);
       console.log(`   📊 Continuing to scan for more opportunities...\n`);
     } else {
-      // Still partial - this shouldn't happen often with market orders
-      trade.status = 'partial';
-      trade.error = `Partial fill - UP=${upFilled ? 'filled' : 'failed'}, DOWN=${downFilled ? 'filled' : 'failed'}`;
-      console.log(`   ⚠️ PARTIAL FILL - One side still not filled (unusual with market orders)`);
+      // This should rarely happen now - we reverse if can't complete
+      trade.status = 'failed';
+      trade.error = `Could not complete pair - UP=${upFilled ? 'filled' : 'failed'}, DOWN=${downFilled ? 'filled' : 'failed'}`;
+      console.log(`   ❌ TRADE FAILED - Could not complete both legs`);
       console.log(`   📊 Continuing to scan for more opportunities...\n`);
     }
 
