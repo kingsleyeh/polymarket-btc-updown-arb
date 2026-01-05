@@ -18,10 +18,10 @@ const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liq
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
 const MARKET_ORDER_SLIPPAGE = 0.02; // 2% - use aggressive limit prices that act like market orders
 const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
-const ORDER_FILL_TIMEOUT_MS = 2000; // 2 seconds to wait for both orders to fill
-const ORDER_CHECK_INTERVAL_MS = 100; // Check order status every 100ms (faster)
-const SECOND_LEG_TIMEOUT_MS = 500; // If one fills, wait 500ms for other, then IMMEDIATELY market order
-const REVERSE_TIMEOUT_MS = 3000; // If can't complete pair in 3s, reverse the filled leg
+const ORDER_FILL_TIMEOUT_MS = 1000; // 1 second MAX to wait for both orders
+const ORDER_CHECK_INTERVAL_MS = 100; // Check every 100ms
+const POSITION_CHECK_INTERVAL_MS = 200; // Check actual positions every 200ms
+const MAX_WAIT_FOR_BOTH_MS = 1000; // Maximum 1 second - if not both, reverse immediately
 // Polymarket
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -364,151 +364,94 @@ async function reversePosition(tokenId, shares) {
     }
 }
 /**
- * Wait for both orders to fill, IMMEDIATELY place market order for second leg if one fills
- * If can't complete pair, reverse the filled leg to close position
+ * BOTH OR NOTHING: Wait for both orders, check positions continuously
+ * If we don't have both within 1 second, cancel everything and reverse any filled leg
  */
 async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId, shares, maxUpPrice, maxDownPrice) {
     if (!upOrderId || !downOrderId) {
         return { upFilled: false, downFilled: false, secondLegOrderId: null, reversed: false };
     }
     const startTime = Date.now();
-    let upFilled = false;
-    let downFilled = false;
     let secondLegOrderId = null;
     let marketOrderPlaced = false;
-    // Fast polling loop
-    let checkCount = 0;
-    while (Date.now() - startTime < ORDER_FILL_TIMEOUT_MS) {
-        checkCount++;
-        // Check both orders in parallel
-        if (!upFilled) {
-            const upStatus = await checkOrderStatus(upOrderId);
-            upFilled = upStatus === 'filled';
-            if (upFilled) {
-                console.log(`   ✓ UP order FILLED (check #${checkCount})`);
+    let lastPositionCheck = 0;
+    // Aggressive loop: check positions every 200ms, max 1 second
+    while (Date.now() - startTime < MAX_WAIT_FOR_BOTH_MS) {
+        const elapsed = Date.now() - startTime;
+        // Check ACTUAL positions (not just order status) every 200ms
+        if (Date.now() - lastPositionCheck >= POSITION_CHECK_INTERVAL_MS) {
+            lastPositionCheck = Date.now();
+            const positions = await checkPositions(upTokenId, downTokenId, shares);
+            const hasUp = positions.hasUp;
+            const hasDown = positions.hasDown;
+            // BOTH POSITIONS - SUCCESS!
+            if (hasUp && hasDown) {
+                console.log(`   ✅ BOTH POSITIONS CONFIRMED after ${(elapsed / 1000).toFixed(2)}s`);
+                // Cancel any pending orders
+                await cancelOrder(upOrderId);
+                await cancelOrder(downOrderId);
+                if (secondLegOrderId)
+                    await cancelOrder(secondLegOrderId);
+                return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
             }
-            else if (upStatus !== 'open' && checkCount <= 3) {
-                console.log(`   ⚠️ UP order status: ${upStatus} (check #${checkCount})`);
-            }
-        }
-        if (!downFilled) {
-            const downStatus = await checkOrderStatus(downOrderId);
-            downFilled = downStatus === 'filled';
-            if (downFilled) {
-                console.log(`   ✓ DOWN order FILLED (check #${checkCount})`);
-            }
-            else if (downStatus !== 'open' && checkCount <= 3) {
-                console.log(`   ⚠️ DOWN order status: ${downStatus} (check #${checkCount})`);
-            }
-        }
-        // If both filled, we're done
-        if (upFilled && downFilled) {
-            console.log(`   ✅ BOTH ORDERS FILLED after ${checkCount} checks`);
-            return { upFilled: true, downFilled: true, secondLegOrderId: null, reversed: false };
-        }
-        // If one filled but other didn't - IMMEDIATELY place market order (no wait)
-        if ((upFilled && !downFilled) || (!upFilled && downFilled)) {
-            if (!marketOrderPlaced) {
+            // ONE-SIDED: Place market order for missing leg IMMEDIATELY
+            if (hasUp && !hasDown && !marketOrderPlaced) {
+                console.log(`   ⚠️ Have UP but no DOWN - placing MARKET order for DOWN NOW...`);
                 marketOrderPlaced = true;
-                if (upFilled && !downFilled) {
-                    console.log(`   ⚠️ UP filled but DOWN didn't - IMMEDIATELY placing MARKET order for DOWN...`);
-                    secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
-                    if (secondLegOrderId) {
-                        console.log(`   ✓ Market order placed for DOWN: ${secondLegOrderId}`);
-                    }
-                }
-                else if (downFilled && !upFilled) {
-                    console.log(`   ⚠️ DOWN filled but UP didn't - IMMEDIATELY placing MARKET order for UP...`);
-                    secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
-                    if (secondLegOrderId) {
-                        console.log(`   ✓ Market order placed for UP: ${secondLegOrderId}`);
-                    }
+                secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
+                if (secondLegOrderId) {
+                    console.log(`   ✓ Market order placed: ${secondLegOrderId}`);
                 }
             }
-            // If we placed market order, check if it filled
-            if (secondLegOrderId) {
-                if (upFilled && !downFilled) {
-                    const downStatus = await checkOrderStatus(secondLegOrderId);
-                    downFilled = downStatus === 'filled';
-                }
-                else if (downFilled && !upFilled) {
-                    const upStatus = await checkOrderStatus(secondLegOrderId);
-                    upFilled = upStatus === 'filled';
-                }
-                // If both filled now, we're done
-                if (upFilled && downFilled) {
-                    return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
+            else if (!hasUp && hasDown && !marketOrderPlaced) {
+                console.log(`   ⚠️ Have DOWN but no UP - placing MARKET order for UP NOW...`);
+                marketOrderPlaced = true;
+                secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
+                if (secondLegOrderId) {
+                    console.log(`   ✓ Market order placed: ${secondLegOrderId}`);
                 }
             }
         }
-        // Wait before next check
-        await new Promise(r => setTimeout(r, ORDER_CHECK_INTERVAL_MS));
+        await new Promise(r => setTimeout(r, 50)); // Fast polling
     }
-    // Final check after timeout
-    const elapsed = Date.now() - startTime;
-    console.log(`   ⏱️ Timeout reached (${(elapsed / 1000).toFixed(1)}s) - checking final status...`);
-    if (!upFilled) {
-        const upStatus = await checkOrderStatus(upOrderId);
-        upFilled = upStatus === 'filled';
-        console.log(`   Final UP status: ${upStatus} (filled: ${upFilled})`);
-    }
-    if (!downFilled) {
-        const downStatus = await checkOrderStatus(downOrderId);
-        downFilled = downStatus === 'filled';
-        console.log(`   Final DOWN status: ${downStatus} (filled: ${downFilled})`);
-    }
-    // Check market order if we placed one
-    if (secondLegOrderId) {
-        const secondStatus = await checkOrderStatus(secondLegOrderId);
-        console.log(`   Final second-leg status: ${secondStatus}`);
-        if (upFilled && !downFilled) {
-            downFilled = secondStatus === 'filled';
-        }
-        else if (downFilled && !upFilled) {
-            upFilled = secondStatus === 'filled';
-        }
-    }
-    // If still only one filled after all attempts, REVERSE the position
-    if ((upFilled && !downFilled) || (downFilled && !upFilled)) {
-        const totalTime = Date.now() - startTime;
-        if (totalTime >= REVERSE_TIMEOUT_MS) {
-            console.log(`   ⚠️ Cannot complete pair after ${(totalTime / 1000).toFixed(1)}s - REVERSING position to avoid exposure...`);
-            let reversed = false;
-            if (upFilled && !downFilled) {
-                // Cancel any pending orders
-                if (downOrderId)
-                    await cancelOrder(downOrderId);
-                if (secondLegOrderId)
-                    await cancelOrder(secondLegOrderId);
-                // Reverse UP position
-                reversed = await reversePosition(upTokenId, shares);
-            }
-            else if (downFilled && !upFilled) {
-                // Cancel any pending orders
-                if (upOrderId)
-                    await cancelOrder(upOrderId);
-                if (secondLegOrderId)
-                    await cancelOrder(secondLegOrderId);
-                // Reverse DOWN position
-                reversed = await reversePosition(downTokenId, shares);
-            }
-            return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
-        }
-    }
-    // Cancel any unfilled orders
-    if (!upFilled && upOrderId) {
+    // TIMEOUT: Check final positions
+    const finalPositions = await checkPositions(upTokenId, downTokenId, shares);
+    const hasUp = finalPositions.hasUp;
+    const hasDown = finalPositions.hasDown;
+    // BOTH - Success (caught it at the last moment)
+    if (hasUp && hasDown) {
+        console.log(`   ✅ BOTH POSITIONS CONFIRMED (at timeout)`);
         await cancelOrder(upOrderId);
-    }
-    if (!downFilled && downOrderId) {
         await cancelOrder(downOrderId);
-    }
-    if (secondLegOrderId) {
-        const secondStatus = await checkOrderStatus(secondLegOrderId);
-        if (secondStatus !== 'filled') {
+        if (secondLegOrderId)
             await cancelOrder(secondLegOrderId);
-        }
+        return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
     }
-    return { upFilled, downFilled, secondLegOrderId, reversed: false };
+    // ONE-SIDED OR NONE - REVERSE IMMEDIATELY
+    console.log(`   ❌ TIMEOUT: Don't have both positions - REVERSING everything...`);
+    // Cancel all pending orders
+    await Promise.all([
+        cancelOrder(upOrderId),
+        cancelOrder(downOrderId),
+        secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
+    ]);
+    // Reverse any filled leg
+    let reversed = false;
+    if (hasUp && !hasDown) {
+        console.log(`   🔄 Reversing ${finalPositions.upBalance.toFixed(0)} UP shares...`);
+        reversed = await reversePosition(upTokenId, Math.floor(finalPositions.upBalance));
+    }
+    else if (!hasUp && hasDown) {
+        console.log(`   🔄 Reversing ${finalPositions.downBalance.toFixed(0)} DOWN shares...`);
+        reversed = await reversePosition(downTokenId, Math.floor(finalPositions.downBalance));
+    }
+    if (reversed) {
+        console.log(`   ✅ Position reversed - no exposure`);
+    }
+    else {
+        console.log(`   ⚠️ Reversal may have failed - check positions manually`);
+    }
+    return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
 }
 /**
  * Execute arbitrage trade - buy both Up and Down in PARALLEL
@@ -632,71 +575,31 @@ export async function executeTrade(arb) {
         console.log(`   ⏳ Waiting for both orders to fill (max ${ORDER_FILL_TIMEOUT_MS / 1000}s)...`);
         // Wait for both orders to fill, place market order for second leg if one fills
         const { upFilled, downFilled, secondLegOrderId, reversed } = await waitForBothOrders(upOrderId, downOrderId, arb.up_token_id, arb.down_token_id, shares, upMaxPrice, downMaxPrice);
-        // CRITICAL: Check actual positions (order status API is unreliable)
-        // If order status says "open" but we have positions, we need to handle it
-        console.log(`   🔍 Checking actual positions (order status may be stale)...`);
-        const positions = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
-        console.log(`   Positions: UP=${positions.upBalance.toFixed(1)} shares, DOWN=${positions.downBalance.toFixed(1)} shares`);
-        // Determine what actually happened
-        const actuallyHasUp = positions.hasUp;
-        const actuallyHasDown = positions.hasDown;
+        // Final position check (waitForBothOrders already checked, but double-check)
+        const finalCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
         // Update order IDs if we placed a market order for second leg
         if (secondLegOrderId) {
-            if (upFilled && !downFilled) {
-                trade.down_order_id = secondLegOrderId;
-            }
-            else if (downFilled && !upFilled) {
-                trade.up_order_id = secondLegOrderId;
-            }
+            trade.down_order_id = secondLegOrderId;
         }
-        // Handle based on ACTUAL positions, not just order status
-        if (actuallyHasUp && actuallyHasDown) {
-            // Both positions exist - success!
+        // BOTH OR NOTHING: Only success if we have both positions
+        if (upFilled && downFilled && finalCheck.hasUp && finalCheck.hasDown) {
             trade.status = 'filled';
             console.log(`   ✅ BOTH POSITIONS CONFIRMED - Profit locked: $${profitUsd.toFixed(2)}`);
             cachedBalance -= costUsd;
             console.log(`   💵 Remaining balance: ~$${cachedBalance.toFixed(2)}`);
             console.log(`   📊 Continuing to scan for more opportunities...\n`);
         }
-        else if (actuallyHasUp && !actuallyHasDown) {
-            // Only UP position - REVERSE immediately
-            console.log(`   ⚠️ ONE-SIDED EXPOSURE DETECTED: Have ${positions.upBalance.toFixed(0)} UP shares, no DOWN`);
-            console.log(`   🔄 REVERSING UP position immediately...`);
-            const reversed = await reversePosition(arb.up_token_id, Math.floor(positions.upBalance));
-            if (reversed) {
-                trade.status = 'failed';
-                trade.error = 'Reversed one-sided UP position';
-                console.log(`   ✅ UP position reversed - avoided exposure`);
-            }
-            else {
-                trade.status = 'failed';
-                trade.error = 'Failed to reverse one-sided UP position';
-                console.log(`   ❌ FAILED to reverse UP position - manual intervention needed!`);
-            }
-            console.log(`   📊 Continuing to scan for more opportunities...\n`);
-        }
-        else if (!actuallyHasUp && actuallyHasDown) {
-            // Only DOWN position - REVERSE immediately
-            console.log(`   ⚠️ ONE-SIDED EXPOSURE DETECTED: Have ${positions.downBalance.toFixed(0)} DOWN shares, no UP`);
-            console.log(`   🔄 REVERSING DOWN position immediately...`);
-            const reversed = await reversePosition(arb.down_token_id, Math.floor(positions.downBalance));
-            if (reversed) {
-                trade.status = 'failed';
-                trade.error = 'Reversed one-sided DOWN position';
-                console.log(`   ✅ DOWN position reversed - avoided exposure`);
-            }
-            else {
-                trade.status = 'failed';
-                trade.error = 'Failed to reverse one-sided DOWN position';
-                console.log(`   ❌ FAILED to reverse DOWN position - manual intervention needed!`);
-            }
-            console.log(`   📊 Continuing to scan for more opportunities...\n`);
-        }
         else {
-            // Neither position - orders didn't fill or were cancelled
+            // Don't have both - trade failed (waitForBothOrders already reversed if needed)
             trade.status = 'failed';
-            trade.error = `No positions detected - orders may not have filled`;
-            console.log(`   ❌ No positions detected - orders likely didn't fill`);
+            if (reversed) {
+                trade.error = 'Reversed one-sided position - no exposure';
+                console.log(`   ✅ Trade failed but position reversed - no exposure`);
+            }
+            else {
+                trade.error = 'Could not complete both legs';
+                console.log(`   ❌ Trade failed - no positions or reversal failed`);
+            }
             console.log(`   📊 Continuing to scan for more opportunities...\n`);
         }
     }
