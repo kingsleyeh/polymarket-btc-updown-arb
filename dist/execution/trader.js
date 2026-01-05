@@ -12,7 +12,7 @@ import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 import axios from 'axios';
 // ============ CONFIGURATION ============
-const TRADE_SIZE_PERCENT = 0.20; // 20% of available balance per trade
+const TRADE_SIZE_PERCENT = 0.10; // 10% of available balance per trade
 const MIN_TRADE_SIZE_USD = 2; // Minimum $2 per trade
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
@@ -94,24 +94,20 @@ export async function getBalance() {
     return cachedBalance;
 }
 /**
- * Fetch current orderbook to verify prices and get liquidity
+ * Fetch current prices to verify they haven't moved (fast verification)
  */
-async function verifyPricesAndLiquidity(upTokenId, downTokenId, expectedUpPrice, expectedDownPrice) {
+async function verifyPricesAndLiquidity(upTokenId, downTokenId, expectedUpPrice, expectedDownPrice, cachedUpLiquidity, cachedDownLiquidity) {
     try {
-        // Fetch both orderbooks in parallel
-        const [upPriceResp, downPriceResp, upBook, downBook] = await Promise.all([
-            axios.get(`${CLOB_HOST}/price`, { params: { token_id: upTokenId, side: 'buy' }, timeout: 3000 }),
-            axios.get(`${CLOB_HOST}/price`, { params: { token_id: downTokenId, side: 'buy' }, timeout: 3000 }),
-            axios.get(`${CLOB_HOST}/book`, { params: { token_id: upTokenId }, timeout: 3000 }),
-            axios.get(`${CLOB_HOST}/book`, { params: { token_id: downTokenId }, timeout: 3000 }),
+        // Only fetch prices (fast) - use cached liquidity from scan
+        const [upPriceResp, downPriceResp] = await Promise.all([
+            axios.get(`${CLOB_HOST}/price`, { params: { token_id: upTokenId, side: 'buy' }, timeout: 1000 }),
+            axios.get(`${CLOB_HOST}/price`, { params: { token_id: downTokenId, side: 'buy' }, timeout: 1000 }),
         ]);
         const currentUpPrice = parseFloat(upPriceResp.data?.price || '0');
         const currentDownPrice = parseFloat(downPriceResp.data?.price || '0');
-        // Get liquidity at best ask
-        const upAsks = upBook.data?.asks || [];
-        const downAsks = downBook.data?.asks || [];
-        const upLiquidity = upAsks.length > 0 ? parseFloat(upAsks[0].size) : 0;
-        const downLiquidity = downAsks.length > 0 ? parseFloat(downAsks[0].size) : 0;
+        // Use cached liquidity from scan (faster - no need to re-fetch)
+        const upLiquidity = cachedUpLiquidity;
+        const downLiquidity = cachedDownLiquidity;
         // Check if prices moved too much
         const upPriceChange = Math.abs(currentUpPrice - expectedUpPrice) / expectedUpPrice;
         const downPriceChange = Math.abs(currentDownPrice - expectedDownPrice) / expectedDownPrice;
@@ -362,9 +358,11 @@ export async function executeTrade(arb) {
         return null;
     }
     const now = Date.now();
-    // Step 1: Verify prices haven't moved
-    console.log(`\n🔍 VERIFYING PRICES...`);
-    const verification = await verifyPricesAndLiquidity(arb.up_token_id, arb.down_token_id, arb.up_price, arb.down_price);
+    // Step 1: Fast price verification (use cached liquidity from scan)
+    console.log(`\n🔍 VERIFYING PRICES (fast)...`);
+    const verification = await verifyPricesAndLiquidity(arb.up_token_id, arb.down_token_id, arb.up_price, arb.down_price, arb.up_shares_available, // Use cached liquidity from scan
+    arb.down_shares_available // Use cached liquidity from scan
+    );
     if (!verification.verified) {
         console.log(`   ❌ ${verification.reason}`);
         return null;

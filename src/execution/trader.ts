@@ -138,13 +138,15 @@ export async function getBalance(): Promise<number> {
 }
 
 /**
- * Fetch current orderbook to verify prices and get liquidity
+ * Fetch current prices to verify they haven't moved (fast verification)
  */
 async function verifyPricesAndLiquidity(
   upTokenId: string,
   downTokenId: string,
   expectedUpPrice: number,
-  expectedDownPrice: number
+  expectedDownPrice: number,
+  cachedUpLiquidity: number,
+  cachedDownLiquidity: number
 ): Promise<{
   verified: boolean;
   upPrice: number;
@@ -154,22 +156,18 @@ async function verifyPricesAndLiquidity(
   reason?: string;
 }> {
   try {
-    // Fetch both orderbooks in parallel
-    const [upPriceResp, downPriceResp, upBook, downBook] = await Promise.all([
-      axios.get(`${CLOB_HOST}/price`, { params: { token_id: upTokenId, side: 'buy' }, timeout: 3000 }),
-      axios.get(`${CLOB_HOST}/price`, { params: { token_id: downTokenId, side: 'buy' }, timeout: 3000 }),
-      axios.get(`${CLOB_HOST}/book`, { params: { token_id: upTokenId }, timeout: 3000 }),
-      axios.get(`${CLOB_HOST}/book`, { params: { token_id: downTokenId }, timeout: 3000 }),
+    // Only fetch prices (fast) - use cached liquidity from scan
+    const [upPriceResp, downPriceResp] = await Promise.all([
+      axios.get(`${CLOB_HOST}/price`, { params: { token_id: upTokenId, side: 'buy' }, timeout: 1000 }),
+      axios.get(`${CLOB_HOST}/price`, { params: { token_id: downTokenId, side: 'buy' }, timeout: 1000 }),
     ]);
 
     const currentUpPrice = parseFloat(upPriceResp.data?.price || '0');
     const currentDownPrice = parseFloat(downPriceResp.data?.price || '0');
     
-    // Get liquidity at best ask
-    const upAsks = upBook.data?.asks || [];
-    const downAsks = downBook.data?.asks || [];
-    const upLiquidity = upAsks.length > 0 ? parseFloat(upAsks[0].size) : 0;
-    const downLiquidity = downAsks.length > 0 ? parseFloat(downAsks[0].size) : 0;
+    // Use cached liquidity from scan (faster - no need to re-fetch)
+    const upLiquidity = cachedUpLiquidity;
+    const downLiquidity = cachedDownLiquidity;
 
     // Check if prices moved too much
     const upPriceChange = Math.abs(currentUpPrice - expectedUpPrice) / expectedUpPrice;
@@ -464,13 +462,15 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
 
   const now = Date.now();
 
-  // Step 1: Verify prices haven't moved
-  console.log(`\n🔍 VERIFYING PRICES...`);
+  // Step 1: Fast price verification (use cached liquidity from scan)
+  console.log(`\n🔍 VERIFYING PRICES (fast)...`);
   const verification = await verifyPricesAndLiquidity(
     arb.up_token_id,
     arb.down_token_id,
     arb.up_price,
-    arb.down_price
+    arb.down_price,
+    arb.up_shares_available, // Use cached liquidity from scan
+    arb.down_shares_available // Use cached liquidity from scan
   );
 
   if (!verification.verified) {
