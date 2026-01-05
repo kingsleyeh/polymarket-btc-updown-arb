@@ -432,29 +432,21 @@ export async function executeTrade(arb) {
         return null;
     }
     const now = Date.now();
-    // Step 1: Fast price verification (use cached liquidity from scan)
-    console.log(`\n🔍 VERIFYING PRICES (fast)...`);
-    const verification = await verifyPricesAndLiquidity(arb.up_token_id, arb.down_token_id, arb.up_price, arb.down_price, arb.up_shares_available, // Use cached liquidity from scan
-    arb.down_shares_available // Use cached liquidity from scan
-    );
-    if (!verification.verified) {
-        console.log(`   ❌ ${verification.reason}`);
-        return null;
-    }
-    // Use verified current prices
-    const upPrice = verification.upPrice;
-    const downPrice = verification.downPrice;
-    const combinedCost = upPrice + downPrice;
-    console.log(`   ✓ Prices verified: UP=$${upPrice.toFixed(3)} DOWN=$${downPrice.toFixed(3)} = $${combinedCost.toFixed(4)}`);
-    console.log(`   ✓ Liquidity: UP=${verification.upLiquidity.toFixed(0)} DOWN=${verification.downLiquidity.toFixed(0)}`);
+    // Use prices directly from scan (already execution prices from /price endpoint)
+    // No verification delay - execute immediately to catch fast-moving arbs
+    const upPrice = arb.up_price;
+    const downPrice = arb.down_price;
+    const combinedCost = arb.combined_cost;
+    console.log(`\n💰 EXECUTING IMMEDIATELY: UP=$${upPrice.toFixed(3)} DOWN=$${downPrice.toFixed(3)} = $${combinedCost.toFixed(4)}`);
+    console.log(`   Liquidity: UP=${arb.up_shares_available.toFixed(0)} DOWN=${arb.down_shares_available.toFixed(0)}`);
     // Check max combined cost protection
     if (combinedCost > MAX_COMBINED_COST) {
         console.log(`   ❌ Combined cost $${combinedCost.toFixed(4)} exceeds max $${MAX_COMBINED_COST.toFixed(2)} - rejecting`);
         return null;
     }
-    // Step 2: Calculate optimal size
+    // Calculate optimal size
     const balance = await getBalance();
-    const { shares, reason } = calculateTradeSize(balance, combinedCost, verification.upLiquidity, verification.downLiquidity);
+    const { shares, reason } = calculateTradeSize(balance, combinedCost, arb.up_shares_available, arb.down_shares_available);
     if (shares < 1) {
         console.log(`   ❌ Cannot trade: ${reason}`);
         return null;
@@ -480,11 +472,9 @@ export async function executeTrade(arb) {
         expiry_timestamp: arb.expiry_timestamp,
         status: 'pending',
     };
-    console.log(`\n💰 EXECUTING TRADE: ${arb.market_title}`);
     console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
     console.log(`   Cost: $${costUsd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
-    // Step 4: Execute BOTH orders in PARALLEL using market-like orders
-    console.log(`   Submitting MARKET-LIKE orders in parallel...`);
+    console.log(`   Submitting MARKET-LIKE orders in parallel (no delay)...`);
     // Use aggressive limit prices that act like market orders
     // Set to max acceptable price to ensure immediate fills
     const upMaxPrice = Math.min(upPrice * (1 + MARKET_ORDER_SLIPPAGE), 0.99);
