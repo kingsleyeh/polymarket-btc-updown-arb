@@ -20,20 +20,20 @@ export async function fetchMarketPrices(market) {
         const [upPriceResp, downPriceResp, upBook, downBook] = await Promise.all([
             axios.get(`${CLOB_API_URL}/price`, {
                 params: { token_id: market.up_token_id, side: 'buy' },
-                timeout: 5000,
+                timeout: 500, // Maximum speed - 500ms timeout
             }),
             axios.get(`${CLOB_API_URL}/price`, {
                 params: { token_id: market.down_token_id, side: 'buy' },
-                timeout: 5000,
+                timeout: 500, // Maximum speed - 500ms timeout
             }),
             // Also get orderbook for liquidity info
             axios.get(`${CLOB_API_URL}/book`, {
                 params: { token_id: market.up_token_id },
-                timeout: 5000,
+                timeout: 500, // Maximum speed - 500ms timeout
             }),
             axios.get(`${CLOB_API_URL}/book`, {
                 params: { token_id: market.down_token_id },
-                timeout: 5000,
+                timeout: 500, // Maximum speed - 500ms timeout
             }),
         ]);
         // Extract execution prices

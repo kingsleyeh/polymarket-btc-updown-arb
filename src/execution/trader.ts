@@ -21,10 +21,11 @@ const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liq
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
 const MARKET_ORDER_SLIPPAGE = 0.02; // 2% - use aggressive limit prices that act like market orders
 const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
-const ORDER_FILL_TIMEOUT_MS = 500; // 500ms MAX - racing other bots
-const ORDER_CHECK_INTERVAL_MS = 50; // Check every 50ms (fast)
-const POSITION_CHECK_INTERVAL_MS = 100; // Check actual positions every 100ms (fast)
-const MAX_WAIT_FOR_BOTH_MS = 500; // Maximum 500ms - if not both, reverse immediately
+const ORDER_FILL_TIMEOUT_MS = 300; // 300ms MAX - maximum speed
+const ORDER_CHECK_INTERVAL_MS = 5; // Check every 5ms (maximum speed)
+const POSITION_CHECK_INTERVAL_MS = 5; // Check actual positions every 5ms (maximum speed)
+const MAX_WAIT_FOR_BOTH_MS = 300; // Maximum 300ms - if not both, reverse immediately
+const POLLING_DELAY_MS = 5; // Polling delay 5ms (maximum speed)
 
 // Polymarket
 const CHAIN_ID = 137;
@@ -402,11 +403,11 @@ async function checkPositions(
       const [upResp, downResp] = await Promise.all([
         axios.get(`${CLOB_HOST}/balance`, {
           params: { token_id: upTokenId },
-          timeout: 500, // Fast timeout for speed
+          timeout: 100, // Maximum speed - 100ms timeout
         }).catch(() => ({ data: { balance: '0' } })),
         axios.get(`${CLOB_HOST}/balance`, {
           params: { token_id: downTokenId },
-          timeout: 500, // Fast timeout for speed
+          timeout: 100, // Maximum speed - 100ms timeout
         }).catch(() => ({ data: { balance: '0' } })),
       ]);
       
@@ -436,10 +437,10 @@ async function reversePosition(
   // Retry up to 3 times
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      // Get current price to sell at market (fast timeout)
+      // Get current price to sell at market (maximum speed)
       const priceResp = await axios.get(`${CLOB_HOST}/price`, {
         params: { token_id: tokenId, side: 'sell' },
-        timeout: 300,
+        timeout: 100, // Maximum speed - 100ms timeout
       });
       
       const sellPrice = parseFloat(priceResp.data?.price || '0');
@@ -465,8 +466,8 @@ async function reversePosition(
       if (order.orderID) {
         console.log(`   ✓ Reversal order placed: ${order.orderID}`);
         
-        // Wait 200ms and verify it filled
-        await new Promise(r => setTimeout(r, 200));
+        // Wait briefly and verify it filled (maximum speed)
+        await new Promise(r => setTimeout(r, POLLING_DELAY_MS * 2)); // 10ms
         const orderStatus = await checkOrderStatus(order.orderID);
         if (orderStatus === 'filled') {
           return true;
@@ -587,7 +588,7 @@ async function waitForBothOrders(
       }
     }
 
-    await new Promise(r => setTimeout(r, 50)); // Poll every 50ms
+    await new Promise(r => setTimeout(r, POLLING_DELAY_MS)); // Poll every 5ms (maximum speed)
   }
 
   // TIMEOUT: Final check - POSITIONS are source of truth

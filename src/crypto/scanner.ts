@@ -34,7 +34,7 @@ export async function scanBTCUpDownMarkets(): Promise<UpDownMarket[]> {
         closed: false,
         limit: 20,
       },
-      timeout: 10000,
+      timeout: 2000, // Maximum speed - 2s timeout
     });
     
     for (const event of response.data || []) {
