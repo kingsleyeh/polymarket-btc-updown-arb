@@ -277,6 +277,58 @@ async function placeMarketOrder(tokenId, size, side, maxPrice) {
     }
 }
 /**
+ * Check actual positions (token balances) to see if we have one-sided exposure
+ * Uses the CLOB API /balance endpoint with token_id
+ */
+async function checkPositions(upTokenId, downTokenId, expectedShares) {
+    if (!clobClient) {
+        return { hasUp: false, hasDown: false, upBalance: 0, downBalance: 0 };
+    }
+    try {
+        // Try using getBalanceAllowance with CONDITIONAL asset type for token positions
+        const [upBalance, downBalance] = await Promise.all([
+            clobClient.getBalanceAllowance({
+                asset_type: AssetType.CONDITIONAL,
+                token_id: upTokenId,
+            }).catch(() => ({ balance: '0' })),
+            clobClient.getBalanceAllowance({
+                asset_type: AssetType.CONDITIONAL,
+                token_id: downTokenId,
+            }).catch(() => ({ balance: '0' })),
+        ]);
+        const upBal = parseFloat(upBalance.balance || '0') / 1_000_000;
+        const downBal = parseFloat(downBalance.balance || '0') / 1_000_000;
+        // Consider we have a position if balance >= 90% of expected (accounting for rounding)
+        const hasUp = upBal >= expectedShares * 0.9;
+        const hasDown = downBal >= expectedShares * 0.9;
+        return { hasUp, hasDown, upBalance: upBal, downBalance: downBal };
+    }
+    catch (error) {
+        // Fallback: try direct API call
+        try {
+            const [upResp, downResp] = await Promise.all([
+                axios.get(`${CLOB_HOST}/balance`, {
+                    params: { token_id: upTokenId },
+                    timeout: 2000,
+                }).catch(() => ({ data: { balance: '0' } })),
+                axios.get(`${CLOB_HOST}/balance`, {
+                    params: { token_id: downTokenId },
+                    timeout: 2000,
+                }).catch(() => ({ data: { balance: '0' } })),
+            ]);
+            const upBal = parseFloat(upResp.data?.balance || '0') / 1_000_000;
+            const downBal = parseFloat(downResp.data?.balance || '0') / 1_000_000;
+            const hasUp = upBal >= expectedShares * 0.9;
+            const hasDown = downBal >= expectedShares * 0.9;
+            return { hasUp, hasDown, upBalance: upBal, downBalance: downBal };
+        }
+        catch (fallbackError) {
+            console.error(`   ⚠️ Failed to check positions: ${error.message}`);
+            return { hasUp: false, hasDown: false, upBalance: 0, downBalance: 0 };
+        }
+    }
+}
+/**
  * Sell/close a position immediately (reverse the filled leg)
  */
 async function reversePosition(tokenId, shares) {
@@ -580,6 +632,14 @@ export async function executeTrade(arb) {
         console.log(`   ⏳ Waiting for both orders to fill (max ${ORDER_FILL_TIMEOUT_MS / 1000}s)...`);
         // Wait for both orders to fill, place market order for second leg if one fills
         const { upFilled, downFilled, secondLegOrderId, reversed } = await waitForBothOrders(upOrderId, downOrderId, arb.up_token_id, arb.down_token_id, shares, upMaxPrice, downMaxPrice);
+        // CRITICAL: Check actual positions (order status API is unreliable)
+        // If order status says "open" but we have positions, we need to handle it
+        console.log(`   🔍 Checking actual positions (order status may be stale)...`);
+        const positions = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
+        console.log(`   Positions: UP=${positions.upBalance.toFixed(1)} shares, DOWN=${positions.downBalance.toFixed(1)} shares`);
+        // Determine what actually happened
+        const actuallyHasUp = positions.hasUp;
+        const actuallyHasDown = positions.hasDown;
         // Update order IDs if we placed a market order for second leg
         if (secondLegOrderId) {
             if (upFilled && !downFilled) {
@@ -589,32 +649,54 @@ export async function executeTrade(arb) {
                 trade.up_order_id = secondLegOrderId;
             }
         }
-        // Determine final status
-        if (reversed) {
-            // Position was reversed to avoid exposure
-            trade.status = 'failed';
-            trade.error = 'Position reversed - could not complete pair';
-            console.log(`   ✅ POSITION REVERSED - Avoided directional exposure`);
-            console.log(`   📊 Continuing to scan for more opportunities...\n`);
-        }
-        else if (upFilled && downFilled) {
+        // Handle based on ACTUAL positions, not just order status
+        if (actuallyHasUp && actuallyHasDown) {
+            // Both positions exist - success!
             trade.status = 'filled';
-            if (secondLegOrderId) {
-                console.log(`   ✅ BOTH ORDERS FILLED (used market order for second leg) - Profit locked: $${profitUsd.toFixed(2)}`);
-            }
-            else {
-                console.log(`   ✅ BOTH ORDERS FILLED - Profit locked: $${profitUsd.toFixed(2)}`);
-            }
-            // Update balance cache (use actual cost, might be slightly higher if market order was used)
+            console.log(`   ✅ BOTH POSITIONS CONFIRMED - Profit locked: $${profitUsd.toFixed(2)}`);
             cachedBalance -= costUsd;
             console.log(`   💵 Remaining balance: ~$${cachedBalance.toFixed(2)}`);
             console.log(`   📊 Continuing to scan for more opportunities...\n`);
         }
+        else if (actuallyHasUp && !actuallyHasDown) {
+            // Only UP position - REVERSE immediately
+            console.log(`   ⚠️ ONE-SIDED EXPOSURE DETECTED: Have ${positions.upBalance.toFixed(0)} UP shares, no DOWN`);
+            console.log(`   🔄 REVERSING UP position immediately...`);
+            const reversed = await reversePosition(arb.up_token_id, Math.floor(positions.upBalance));
+            if (reversed) {
+                trade.status = 'failed';
+                trade.error = 'Reversed one-sided UP position';
+                console.log(`   ✅ UP position reversed - avoided exposure`);
+            }
+            else {
+                trade.status = 'failed';
+                trade.error = 'Failed to reverse one-sided UP position';
+                console.log(`   ❌ FAILED to reverse UP position - manual intervention needed!`);
+            }
+            console.log(`   📊 Continuing to scan for more opportunities...\n`);
+        }
+        else if (!actuallyHasUp && actuallyHasDown) {
+            // Only DOWN position - REVERSE immediately
+            console.log(`   ⚠️ ONE-SIDED EXPOSURE DETECTED: Have ${positions.downBalance.toFixed(0)} DOWN shares, no UP`);
+            console.log(`   🔄 REVERSING DOWN position immediately...`);
+            const reversed = await reversePosition(arb.down_token_id, Math.floor(positions.downBalance));
+            if (reversed) {
+                trade.status = 'failed';
+                trade.error = 'Reversed one-sided DOWN position';
+                console.log(`   ✅ DOWN position reversed - avoided exposure`);
+            }
+            else {
+                trade.status = 'failed';
+                trade.error = 'Failed to reverse one-sided DOWN position';
+                console.log(`   ❌ FAILED to reverse DOWN position - manual intervention needed!`);
+            }
+            console.log(`   📊 Continuing to scan for more opportunities...\n`);
+        }
         else {
-            // This should rarely happen now - we reverse if can't complete
+            // Neither position - orders didn't fill or were cancelled
             trade.status = 'failed';
-            trade.error = `Could not complete pair - UP=${upFilled ? 'filled' : 'failed'}, DOWN=${downFilled ? 'filled' : 'failed'}`;
-            console.log(`   ❌ TRADE FAILED - Could not complete both legs`);
+            trade.error = `No positions detected - orders may not have filled`;
+            console.log(`   ❌ No positions detected - orders likely didn't fill`);
             console.log(`   📊 Continuing to scan for more opportunities...\n`);
         }
     }
