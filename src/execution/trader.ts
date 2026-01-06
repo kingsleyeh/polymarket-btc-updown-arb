@@ -80,13 +80,20 @@ export async function initializeTrader(): Promise<boolean> {
  * Get the REAL ask price from order book to fill N shares
  * Returns price and available liquidity
  */
-async function getOrderBookAsk(tokenId: string, sharesNeeded: number): Promise<{price: number, available: number} | null> {
+async function getOrderBookAsk(tokenId: string, sharesNeeded: number, label: string): Promise<{price: number, available: number} | null> {
   if (!clobClient) return null;
   
   try {
     const book = await clobClient.getOrderBook(tokenId);
     
+    // DEBUG: Log raw order book structure
+    console.log(`   📖 ${label} book: ${book.asks?.length || 0} asks, ${book.bids?.length || 0} bids`);
+    if (book.asks && book.asks.length > 0) {
+      console.log(`   📖 ${label} best ask: $${book.asks[0].price} (${book.asks[0].size} shares)`);
+    }
+    
     if (!book || !book.asks || book.asks.length === 0) {
+      console.log(`   ⚠️ ${label}: No asks in order book`);
       return null;
     }
     
@@ -110,7 +117,8 @@ async function getOrderBookAsk(tokenId: string, sharesNeeded: number): Promise<{
     
     // Not enough liquidity - return what's available at worst price
     return { price: worstPrice, available: sharesAccum };
-  } catch (error) {
+  } catch (error: any) {
+    console.log(`   ❌ ${label} order book error: ${error.message}`);
     return null;
   }
 }
@@ -303,8 +311,8 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
   console.log(`\n   📖 Fetching order books...`);
   
   const [upBook, downBook] = await Promise.all([
-    getOrderBookAsk(arb.up_token_id, MIN_SHARES),
-    getOrderBookAsk(arb.down_token_id, MIN_SHARES)
+    getOrderBookAsk(arb.up_token_id, MIN_SHARES, 'UP'),
+    getOrderBookAsk(arb.down_token_id, MIN_SHARES, 'DOWN')
   ]);
   
   if (!upBook || !downBook) {

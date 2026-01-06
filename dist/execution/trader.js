@@ -54,12 +54,18 @@ export async function initializeTrader() {
  * Get the REAL ask price from order book to fill N shares
  * Returns price and available liquidity
  */
-async function getOrderBookAsk(tokenId, sharesNeeded) {
+async function getOrderBookAsk(tokenId, sharesNeeded, label) {
     if (!clobClient)
         return null;
     try {
         const book = await clobClient.getOrderBook(tokenId);
+        // DEBUG: Log raw order book structure
+        console.log(`   📖 ${label} book: ${book.asks?.length || 0} asks, ${book.bids?.length || 0} bids`);
+        if (book.asks && book.asks.length > 0) {
+            console.log(`   📖 ${label} best ask: $${book.asks[0].price} (${book.asks[0].size} shares)`);
+        }
         if (!book || !book.asks || book.asks.length === 0) {
+            console.log(`   ⚠️ ${label}: No asks in order book`);
             return null;
         }
         // Asks are sorted lowest first (best ask first)
@@ -80,6 +86,7 @@ async function getOrderBookAsk(tokenId, sharesNeeded) {
         return { price: worstPrice, available: sharesAccum };
     }
     catch (error) {
+        console.log(`   ❌ ${label} order book error: ${error.message}`);
         return null;
     }
 }
@@ -248,8 +255,8 @@ export async function executeTrade(arb) {
     // STEP 1: GET REAL ORDER BOOK PRICES
     console.log(`\n   📖 Fetching order books...`);
     const [upBook, downBook] = await Promise.all([
-        getOrderBookAsk(arb.up_token_id, MIN_SHARES),
-        getOrderBookAsk(arb.down_token_id, MIN_SHARES)
+        getOrderBookAsk(arb.up_token_id, MIN_SHARES, 'UP'),
+        getOrderBookAsk(arb.down_token_id, MIN_SHARES, 'DOWN')
     ]);
     if (!upBook || !downBook) {
         console.log(`   ❌ Could not fetch order book`);
