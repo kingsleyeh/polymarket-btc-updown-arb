@@ -1,8 +1,10 @@
 /**
- * ULTRA-LOW LATENCY Execution
+ * SEQUENTIAL Execution - ONLY way to guarantee UP = DOWN
  *
- * Scanner already fetched order book - USE THOSE PRICES
- * Place orders IMMEDIATELY - no redundant API calls
+ * 1. Place DOWN order, wait for fill
+ * 2. Check EXACTLY how many DOWN we got
+ * 3. Place UP order for EXACTLY that amount
+ * 4. If imbalanced, reverse to 0
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -17,7 +19,7 @@ interface ExecutedTrade {
 export declare function canTradeMarket(marketId: string): boolean;
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * FAST EXECUTE - Use scanner prices directly, no redundant fetches
+ * SEQUENTIAL EXECUTE - Guarantees UP = DOWN
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {

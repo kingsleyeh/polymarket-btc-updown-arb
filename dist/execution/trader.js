@@ -1,15 +1,16 @@
 /**
- * ULTRA-LOW LATENCY Execution
+ * SEQUENTIAL Execution - ONLY way to guarantee UP = DOWN
  *
- * Scanner already fetched order book - USE THOSE PRICES
- * Place orders IMMEDIATELY - no redundant API calls
+ * 1. Place DOWN order, wait for fill
+ * 2. Check EXACTLY how many DOWN we got
+ * 3. Place UP order for EXACTLY that amount
+ * 4. If imbalanced, reverse to 0
  */
 import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 // Configuration
 const MIN_SHARES = 5;
 const FILL_TIMEOUT_MS = 2000;
-const POSITION_CHECK_INTERVAL_MS = 100;
 const SETTLEMENT_WAIT_MS = 2000;
 // Polymarket
 const CHAIN_ID = 137;
@@ -72,14 +73,26 @@ async function getBothPositions(upTokenId, downTokenId) {
     ]);
     return { up, down };
 }
-/**
- * Place order - fire and forget style
- */
-async function placeOrder(tokenId, shares, price, label) {
+async function cancelAllOrders() {
     if (!clobClient)
-        return null;
-    // Add tiny buffer to take the ask
-    const takePrice = Math.min(price + 0.005, 0.99);
+        return;
+    try {
+        const openOrders = await clobClient.getOpenOrders();
+        if (openOrders && openOrders.length > 0) {
+            console.log(`   🧹 Cancelling ${openOrders.length} open orders...`);
+            await Promise.all(openOrders.map(o => clobClient.cancelOrder({ orderID: o.id })));
+            // Wait for cancellations to propagate
+            await new Promise(r => setTimeout(r, 500));
+        }
+    }
+    catch { }
+}
+async function placeAndWaitForFill(tokenId, shares, price, label) {
+    if (!clobClient)
+        return 0;
+    const takePrice = Math.min(price + 0.01, 0.99);
+    const startPos = await getPosition(tokenId);
+    console.log(`   📥 ${label}: Buying ${shares} @ $${takePrice.toFixed(3)}...`);
     try {
         const result = await clobClient.createAndPostOrder({
             tokenID: tokenId,
@@ -87,96 +100,73 @@ async function placeOrder(tokenId, shares, price, label) {
             size: shares,
             side: Side.BUY,
         }).catch(e => ({ error: e }));
-        return result && !('error' in result) ? result.orderID : null;
+        const orderId = result && !('error' in result) ? result.orderID : null;
+        if (!orderId) {
+            console.log(`   ❌ ${label} order failed`);
+            return 0;
+        }
+        // Wait for fill
+        await new Promise(r => setTimeout(r, FILL_TIMEOUT_MS));
+        // Cancel any remaining
+        try {
+            await clobClient.cancelOrder({ orderID: orderId });
+        }
+        catch { }
+        // Check how many we got
+        const endPos = await getPosition(tokenId);
+        const filled = endPos - startPos;
+        console.log(`   ✓ ${label}: Got ${filled} shares`);
+        return filled;
     }
-    catch {
-        return null;
+    catch (error) {
+        console.log(`   ❌ ${label} error: ${error.message}`);
+        return 0;
     }
-}
-async function cancelOrder(orderId) {
-    if (!clobClient)
-        return;
-    try {
-        await clobClient.cancelOrder({ orderID: orderId });
-    }
-    catch { }
 }
 async function marketSell(tokenId, shares, label) {
     if (!clobClient || shares <= 0)
         return true;
-    console.log(`   📤 SELLING ${shares} ${label} (waiting for settlement)...`);
+    console.log(`   📤 Selling ${shares} ${label}...`);
     await new Promise(r => setTimeout(r, SETTLEMENT_WAIT_MS));
     try {
-        console.log(`   📤 Placing SELL order for ${shares} ${label} @ $0.01...`);
         const result = await clobClient.createAndPostOrder({
             tokenID: tokenId,
             price: 0.01,
             size: shares,
-            side: Side.SELL, // SELL not BUY!
+            side: Side.SELL,
         }).catch(e => ({ error: e }));
         if (result && !('error' in result)) {
-            const orderId = result.orderID;
-            console.log(`   ✓ Sell order placed: ${orderId}`);
             await new Promise(r => setTimeout(r, 1500));
             const remaining = await getPosition(tokenId);
-            console.log(`   📊 ${label} remaining: ${remaining}`);
+            console.log(`   ${remaining === 0 ? '✓' : '❌'} ${label}: ${remaining} remaining`);
             return remaining === 0;
         }
-        else {
-            const err = result?.error;
-            console.log(`   ❌ Sell failed: ${err?.data?.error || err?.message || 'Unknown'}`);
-            return false;
-        }
+        return false;
     }
-    catch (e) {
-        console.log(`   ❌ Sell error: ${e.message}`);
+    catch {
         return false;
     }
 }
 async function reverseToZero(upTokenId, downTokenId) {
-    // First cancel any open orders that might fill while we're reversing
     await cancelAllOrders();
     const pos = await getBothPositions(upTokenId, downTokenId);
-    console.log(`   🔄 Need to sell: ${pos.up} UP, ${pos.down} DOWN`);
-    // Sell sequentially to avoid confusion
-    if (pos.up > 0) {
+    console.log(`   🔄 Reversing: ${pos.up} UP, ${pos.down} DOWN`);
+    if (pos.up > 0)
         await marketSell(upTokenId, pos.up, 'UP');
-    }
-    if (pos.down > 0) {
+    if (pos.down > 0)
         await marketSell(downTokenId, pos.down, 'DOWN');
-    }
-    // Cancel again in case anything snuck through
     await cancelAllOrders();
     const final = await getBothPositions(upTokenId, downTokenId);
-    const success = final.up === 0 && final.down === 0;
-    console.log(success ? `   ✅ Reversed to 0` : `   ❌ Still have: ${final.up} UP, ${final.down} DOWN`);
-    return success;
+    return final.up === 0 && final.down === 0;
 }
 /**
- * Cancel ALL open orders for a token
- */
-async function cancelAllOrders() {
-    if (!clobClient)
-        return;
-    try {
-        const openOrders = await clobClient.getOpenOrders();
-        if (openOrders && openOrders.length > 0) {
-            console.log(`   🧹 Cancelling ${openOrders.length} stale orders...`);
-            await Promise.all(openOrders.map(o => cancelOrder(o.id)));
-        }
-    }
-    catch { }
-}
-/**
- * FAST EXECUTE - Use scanner prices directly, no redundant fetches
+ * SEQUENTIAL EXECUTE - Guarantees UP = DOWN
  */
 export async function executeTrade(arb) {
     if (!clobClient || !wallet)
         return null;
     if (brokenMarkets.has(arb.market_id) || completedMarkets.has(arb.market_id))
         return null;
-    // FIRST: Cancel any stale orders from previous attempts
-    await cancelAllOrders();
     const startTime = Date.now();
     const trade = {
         id: `trade-${Date.now()}`,
@@ -186,40 +176,44 @@ export async function executeTrade(arb) {
         has_exposure: false,
         can_retry: true,
     };
-    // ===== IMMEDIATE ORDER PLACEMENT =====
-    // Scanner already verified prices - JUST EXECUTE
-    const totalCost = (arb.up_price + arb.down_price) * MIN_SHARES;
-    console.log(`\n   ⚡ FAST EXECUTE: ${MIN_SHARES} shares @ $${arb.combined_cost.toFixed(3)}`);
-    console.log(`   UP: $${arb.up_price.toFixed(3)} | DOWN: $${arb.down_price.toFixed(3)} | Cost: $${totalCost.toFixed(2)}`);
-    // Place BOTH orders simultaneously - no waiting
-    const orderPromises = Promise.all([
-        placeOrder(arb.down_token_id, MIN_SHARES, arb.down_price, 'DOWN'),
-        placeOrder(arb.up_token_id, MIN_SHARES, arb.up_price, 'UP')
-    ]);
-    const [downOrderId, upOrderId] = await orderPromises;
-    const orderTime = Date.now() - startTime;
-    console.log(`   📨 Orders placed in ${orderTime}ms`);
-    if (!downOrderId && !upOrderId) {
-        console.log(`   ❌ Both orders failed`);
-        trade.error = 'Both orders failed';
+    // Cancel any stale orders first
+    await cancelAllOrders();
+    // Check starting position
+    const startPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
+    // If already imbalanced, reverse first
+    if (startPos.up !== startPos.down) {
+        console.log(`   ⚠️ Pre-existing imbalance: ${startPos.up} UP, ${startPos.down} DOWN`);
+        if (!await reverseToZero(arb.up_token_id, arb.down_token_id)) {
+            brokenMarkets.add(arb.market_id);
+            trade.has_exposure = true;
+            trade.can_retry = false;
+            trade.error = 'Could not reverse pre-existing imbalance';
+            executedTrades.push(trade);
+            return trade;
+        }
+    }
+    console.log(`\n   ⚡ SEQUENTIAL: DOWN first, then match UP`);
+    console.log(`   Target: ${MIN_SHARES} shares @ $${arb.combined_cost.toFixed(3)}`);
+    // ===== STEP 1: Buy DOWN =====
+    const downFilled = await placeAndWaitForFill(arb.down_token_id, MIN_SHARES, arb.down_price, 'DOWN');
+    if (downFilled === 0) {
+        console.log(`   ⚠️ No DOWN fills - can retry`);
+        trade.error = 'DOWN did not fill';
+        trade.can_retry = true;
         executedTrades.push(trade);
         return trade;
     }
-    // Wait for fills
-    await new Promise(r => setTimeout(r, FILL_TIMEOUT_MS));
-    // Cancel unfilled
-    await Promise.all([
-        downOrderId ? cancelOrder(downOrderId) : null,
-        upOrderId ? cancelOrder(upOrderId) : null
-    ]);
-    // Check result
+    // ===== STEP 2: Buy EXACT same amount of UP =====
+    console.log(`   📊 Got ${downFilled} DOWN - now buying ${downFilled} UP to match`);
+    const upFilled = await placeAndWaitForFill(arb.up_token_id, downFilled, arb.up_price, 'UP');
+    // ===== CHECK RESULT =====
     const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     const totalTime = Date.now() - startTime;
-    console.log(`   📊 Result: ${finalPos.up} UP, ${finalPos.down} DOWN (${totalTime}ms total)`);
-    // SUCCESS
+    console.log(`\n   📊 FINAL: ${finalPos.up} UP, ${finalPos.down} DOWN (${totalTime}ms)`);
+    // SUCCESS: Equal positions
     if (finalPos.up === finalPos.down && finalPos.up > 0) {
         const profit = finalPos.up * (1 - arb.combined_cost);
-        console.log(`   ✅ SUCCESS! ${finalPos.up} each | Profit: ~$${profit.toFixed(2)}`);
+        console.log(`   ✅✅ SUCCESS! ${finalPos.up} each | Profit: ~$${profit.toFixed(2)}`);
         completedMarkets.add(arb.market_id);
         trade.status = 'filled';
         trade.shares = finalPos.up;
@@ -228,21 +222,15 @@ export async function executeTrade(arb) {
         executedTrades.push(trade);
         return trade;
     }
-    // ZERO - can retry
-    if (finalPos.up === 0 && finalPos.down === 0) {
-        console.log(`   ⚠️ No fills - retrying...`);
-        trade.error = 'No fills';
-        trade.can_retry = true;
-        executedTrades.push(trade);
-        return trade;
-    }
-    // IMBALANCED - auto reverse
-    console.log(`   🚨 Imbalanced - reversing...`);
+    // IMBALANCED: Reverse to 0
+    console.log(`   🚨 Imbalanced! Reversing...`);
     if (await reverseToZero(arb.up_token_id, arb.down_token_id)) {
-        trade.error = 'Reversed';
+        console.log(`   ✓ Reversed to 0 - can retry`);
+        trade.error = 'Imbalanced, reversed';
         trade.can_retry = true;
     }
     else {
+        console.log(`   ❌ Reversal failed - manual fix needed`);
         brokenMarkets.add(arb.market_id);
         trade.has_exposure = true;
         trade.can_retry = false;
