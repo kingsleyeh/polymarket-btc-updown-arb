@@ -1,8 +1,8 @@
 /**
- * FAST MARKET ORDER Execution
+ * SIMPLE LIMIT ORDER EXECUTION
  *
- * TRUE market orders: buy at $0.99 to take ANY available ask
- * Minimal waits - speed is everything
+ * Place both orders, wait for fills, verify positions
+ * No FAK, no race conditions, no stale position checks
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -17,7 +17,11 @@ interface ExecutedTrade {
 export declare function canTradeMarket(marketId: string): boolean;
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * FAST SEQUENTIAL EXECUTE
+ * MAIN EXECUTION
+ *
+ * 1. Place BOTH limit orders simultaneously at detected prices
+ * 2. Wait for fills
+ * 3. Verify final positions match
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {
