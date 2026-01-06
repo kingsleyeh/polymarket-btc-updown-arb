@@ -1,29 +1,23 @@
 /**
- * Real Trade Execution - Optimized
+ * Real Trade Execution - SEQUENTIAL STRATEGY
  *
- * Features:
- * - Parallel order execution
- * - Dynamic sizing (% of balance)
- * - Liquidity-aware (don't move the market)
- * - Slippage protection
- * - Price verification before execution
+ * NEW APPROACH: DOWN first, then UP
+ * - Place DOWN order first (historically harder to fill)
+ * - Wait for DOWN to fill
+ * - ONLY then place UP order
+ * - If DOWN doesn't fill, cancel and retry (no exposure)
+ * - If DOWN fills but UP doesn't, we have DOWN exposure (report it)
  */
 import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
-import axios from 'axios';
 // ============ CONFIGURATION ============
 const TRADE_SIZE_PERCENT = 0.10; // 10% of available balance per trade
 const MIN_SHARES = 5; // Polymarket requires minimum 5 shares per order
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
-const MARKET_ORDER_SLIPPAGE = 0.03; // 3% - aggressive to ensure fills
-const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
-const ORDER_FILL_TIMEOUT_MS = 2000; // 2s to wait for orders to fill
-const ORDER_CHECK_INTERVAL_MS = 50; // Check every 50ms
-const POSITION_CHECK_INTERVAL_MS = 50; // Check positions every 50ms
-const MAX_WAIT_FOR_BOTH_MS = 2000; // 2s max wait for both orders
-const POLLING_DELAY_MS = 50; // Polling delay 50ms
-const API_TIMEOUT_MS = 2000; // 2s timeout for API calls (can't be too short!)
+const FILL_TIMEOUT_MS = 2000; // 2 seconds to wait for each order to fill
+const POSITION_CHECK_INTERVAL_MS = 100; // Check positions every 100ms
+const API_TIMEOUT_MS = 2000; // 2s timeout for API calls
 // Polymarket
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -61,7 +55,7 @@ export async function initializeTrader() {
         console.log(`   Trade size: ${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of balance`);
         console.log(`   Minimum shares: ${MIN_SHARES} (Polymarket requirement)`);
         console.log(`   Max liquidity take: ${(MAX_LIQUIDITY_PERCENT * 100).toFixed(0)}%`);
-        console.log(`   Market order slippage: ${(MARKET_ORDER_SLIPPAGE * 100).toFixed(1)}%`);
+        console.log(`   Strategy: SEQUENTIAL (DOWN first, then UP)`);
         return true;
     }
     catch (error) {
@@ -97,149 +91,32 @@ export async function getBalance() {
     return cachedBalance;
 }
 /**
- * Fetch current prices to verify they haven't moved (fast verification)
+ * Check actual positions (token balances)
  */
-async function verifyPricesAndLiquidity(upTokenId, downTokenId, expectedUpPrice, expectedDownPrice, cachedUpLiquidity, cachedDownLiquidity) {
+async function checkPositions(upTokenId, downTokenId, expectedShares) {
+    if (!clobClient) {
+        return { hasUp: false, hasDown: false, upBalance: 0, downBalance: 0 };
+    }
     try {
-        // Only fetch prices (fast) - use cached liquidity from scan
-        const [upPriceResp, downPriceResp] = await Promise.all([
-            axios.get(`${CLOB_HOST}/price`, { params: { token_id: upTokenId, side: 'buy' }, timeout: 1000 }),
-            axios.get(`${CLOB_HOST}/price`, { params: { token_id: downTokenId, side: 'buy' }, timeout: 1000 }),
+        const [upBalance, downBalance] = await Promise.all([
+            clobClient.getBalanceAllowance({
+                asset_type: AssetType.CONDITIONAL,
+                token_id: upTokenId,
+            }).catch(() => ({ balance: '0' })),
+            clobClient.getBalanceAllowance({
+                asset_type: AssetType.CONDITIONAL,
+                token_id: downTokenId,
+            }).catch(() => ({ balance: '0' })),
         ]);
-        const currentUpPrice = parseFloat(upPriceResp.data?.price || '0');
-        const currentDownPrice = parseFloat(downPriceResp.data?.price || '0');
-        // Use cached liquidity from scan (faster - no need to re-fetch)
-        const upLiquidity = cachedUpLiquidity;
-        const downLiquidity = cachedDownLiquidity;
-        // Check if prices moved too much
-        const upPriceChange = Math.abs(currentUpPrice - expectedUpPrice) / expectedUpPrice;
-        const downPriceChange = Math.abs(currentDownPrice - expectedDownPrice) / expectedDownPrice;
-        if (upPriceChange > PRICE_VERIFY_TOLERANCE) {
-            return {
-                verified: false,
-                upPrice: currentUpPrice,
-                downPrice: currentDownPrice,
-                upLiquidity,
-                downLiquidity,
-                reason: `UP price moved ${(upPriceChange * 100).toFixed(1)}% (was $${expectedUpPrice.toFixed(3)}, now $${currentUpPrice.toFixed(3)})`,
-            };
-        }
-        if (downPriceChange > PRICE_VERIFY_TOLERANCE) {
-            return {
-                verified: false,
-                upPrice: currentUpPrice,
-                downPrice: currentDownPrice,
-                upLiquidity,
-                downLiquidity,
-                reason: `DOWN price moved ${(downPriceChange * 100).toFixed(1)}% (was $${expectedDownPrice.toFixed(3)}, now $${currentDownPrice.toFixed(3)})`,
-            };
-        }
-        // Verify combined cost still gives us an arb
-        const combinedCost = currentUpPrice + currentDownPrice;
-        if (combinedCost >= 0.98) {
-            return {
-                verified: false,
-                upPrice: currentUpPrice,
-                downPrice: currentDownPrice,
-                upLiquidity,
-                downLiquidity,
-                reason: `No arb anymore - combined cost is now $${combinedCost.toFixed(4)}`,
-            };
-        }
-        return {
-            verified: true,
-            upPrice: currentUpPrice,
-            downPrice: currentDownPrice,
-            upLiquidity,
-            downLiquidity,
-        };
+        const upBal = parseFloat(upBalance.balance || '0') / 1_000_000;
+        const downBal = parseFloat(downBalance.balance || '0') / 1_000_000;
+        // Consider we have a position if balance >= 90% of expected
+        const hasUp = upBal >= expectedShares * 0.9;
+        const hasDown = downBal >= expectedShares * 0.9;
+        return { hasUp, hasDown, upBalance: upBal, downBalance: downBal };
     }
     catch (error) {
-        return {
-            verified: false,
-            upPrice: 0,
-            downPrice: 0,
-            upLiquidity: 0,
-            downLiquidity: 0,
-            reason: `Failed to verify prices: ${error.message}`,
-        };
-    }
-}
-/**
- * Calculate optimal trade size
- */
-function calculateTradeSize(balance, combinedCost, upLiquidity, downLiquidity) {
-    // Start with % of balance
-    let targetUsd = balance * TRADE_SIZE_PERCENT;
-    let reason = `${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of $${balance.toFixed(2)} balance`;
-    // Calculate shares from USD
-    let shares = Math.floor(targetUsd / combinedCost);
-    // Enforce Polymarket's minimum 5 shares requirement
-    if (shares < MIN_SHARES) {
-        // Check if we can afford minimum 5 shares
-        const minCost = MIN_SHARES * combinedCost;
-        if (minCost > balance) {
-            return { shares: 0, reason: `cannot afford minimum ${MIN_SHARES} shares (need $${minCost.toFixed(2)}, have $${balance.toFixed(2)})` };
-        }
-        // Use minimum 5 shares if we can afford it
-        shares = MIN_SHARES;
-        reason = `minimum ${MIN_SHARES} shares (can afford $${minCost.toFixed(2)} of $${balance.toFixed(2)} balance)`;
-    }
-    // Respect liquidity - don't take more than MAX_LIQUIDITY_PERCENT of available
-    const maxUpShares = Math.floor(upLiquidity * MAX_LIQUIDITY_PERCENT);
-    const maxDownShares = Math.floor(downLiquidity * MAX_LIQUIDITY_PERCENT);
-    const liquidityLimit = Math.min(maxUpShares, maxDownShares);
-    if (shares > liquidityLimit && liquidityLimit >= MIN_SHARES) {
-        // Only limit if liquidity allows at least minimum shares
-        shares = liquidityLimit;
-        reason = `limited by liquidity (${(MAX_LIQUIDITY_PERCENT * 100).toFixed(0)}% of ${Math.min(upLiquidity, downLiquidity).toFixed(0)} available)`;
-    }
-    else if (shares > liquidityLimit && liquidityLimit < MIN_SHARES) {
-        // Liquidity is too low - can't meet minimum
-        return { shares: 0, reason: `insufficient liquidity (need ${MIN_SHARES} shares, only ${liquidityLimit.toFixed(0)} available)` };
-    }
-    // Final check - must have at least minimum shares
-    if (shares < MIN_SHARES) {
-        return { shares: 0, reason: `below minimum ${MIN_SHARES} shares` };
-    }
-    return { shares, reason };
-}
-/**
- * Check if an order is filled
- */
-async function checkOrderStatus(orderId) {
-    if (!clobClient)
-        return 'unknown';
-    try {
-        const order = await clobClient.getOrder(orderId);
-        if (!order) {
-            // Order not found - might be filled and removed from system
-            return 'unknown';
-        }
-        // Check order status (case-insensitive)
-        const status = String(order.status || '').toLowerCase();
-        if (status === 'filled' || status === 'complete') {
-            return 'filled';
-        }
-        if (status === 'cancelled' || status === 'canceled') {
-            return 'cancelled';
-        }
-        // Check if order is partially filled (treat as filled for our purposes)
-        const orderAny = order;
-        const filledSize = parseFloat(orderAny.filledSize || orderAny.filled_size || '0');
-        const orderSize = parseFloat(orderAny.size || orderAny.orderSize || '0');
-        if (filledSize > 0 && orderSize > 0 && filledSize >= orderSize * 0.95) {
-            // 95%+ filled counts as filled
-            return 'filled';
-        }
-        return 'open';
-    }
-    catch (error) {
-        // If order not found (404), it might be filled and removed
-        if (error?.response?.status === 404) {
-            return 'unknown'; // Could be filled
-        }
-        return 'unknown';
+        return { hasUp: false, hasDown: false, upBalance: 0, downBalance: 0 };
     }
 }
 /**
@@ -253,216 +130,55 @@ async function cancelOrder(orderId) {
         return true;
     }
     catch (error) {
-        console.error(`   Failed to cancel order ${orderId}: ${error.message}`);
         return false;
     }
 }
 /**
- * Place market order (aggressive limit that acts like market)
+ * Calculate optimal trade size
  */
-async function placeMarketOrder(tokenId, size, side, maxPrice) {
-    if (!clobClient)
-        return null;
-    try {
-        // Use very aggressive limit price (maxPrice) - will fill immediately if liquidity exists
-        const order = await clobClient.createAndPostOrder({
-            tokenID: tokenId,
-            price: maxPrice, // Set to max acceptable price - acts like market order
-            size: size,
-            side: side,
-        });
-        return order.orderID || null;
-    }
-    catch (error) {
-        console.error(`   Market order failed: ${error.message}`);
-        return null;
-    }
-}
-/**
- * Check actual positions (token balances) to see if we have one-sided exposure
- * Uses the CLOB API /balance endpoint with token_id
- */
-async function checkPositions(upTokenId, downTokenId, expectedShares) {
-    if (!clobClient) {
-        return { hasUp: false, hasDown: false, upBalance: 0, downBalance: 0 };
-    }
-    try {
-        // Try using getBalanceAllowance with CONDITIONAL asset type for token positions
-        const [upBalance, downBalance] = await Promise.all([
-            clobClient.getBalanceAllowance({
-                asset_type: AssetType.CONDITIONAL,
-                token_id: upTokenId,
-            }).catch(() => ({ balance: '0' })),
-            clobClient.getBalanceAllowance({
-                asset_type: AssetType.CONDITIONAL,
-                token_id: downTokenId,
-            }).catch(() => ({ balance: '0' })),
-        ]);
-        const upBal = parseFloat(upBalance.balance || '0') / 1_000_000;
-        const downBal = parseFloat(downBalance.balance || '0') / 1_000_000;
-        // Consider we have a position if balance >= 90% of expected (accounting for rounding)
-        const hasUp = upBal >= expectedShares * 0.9;
-        const hasDown = downBal >= expectedShares * 0.9;
-        return { hasUp, hasDown, upBalance: upBal, downBalance: downBal };
-    }
-    catch (error) {
-        // Fallback: try direct API call
-        try {
-            const [upResp, downResp] = await Promise.all([
-                axios.get(`${CLOB_HOST}/balance`, {
-                    params: { token_id: upTokenId },
-                    timeout: API_TIMEOUT_MS,
-                }).catch(() => ({ data: { balance: '0' } })),
-                axios.get(`${CLOB_HOST}/balance`, {
-                    params: { token_id: downTokenId },
-                    timeout: API_TIMEOUT_MS,
-                }).catch(() => ({ data: { balance: '0' } })),
-            ]);
-            const upBal = parseFloat(upResp.data?.balance || '0') / 1_000_000;
-            const downBal = parseFloat(downResp.data?.balance || '0') / 1_000_000;
-            const hasUp = upBal >= expectedShares * 0.9;
-            const hasDown = downBal >= expectedShares * 0.9;
-            return { hasUp, hasDown, upBalance: upBal, downBalance: downBal };
+function calculateTradeSize(balance, combinedCost, upLiquidity, downLiquidity) {
+    let targetUsd = balance * TRADE_SIZE_PERCENT;
+    let reason = `${(TRADE_SIZE_PERCENT * 100).toFixed(0)}% of $${balance.toFixed(2)} balance`;
+    let shares = Math.floor(targetUsd / combinedCost);
+    if (shares < MIN_SHARES) {
+        const minCost = MIN_SHARES * combinedCost;
+        if (minCost > balance) {
+            return { shares: 0, reason: `cannot afford minimum ${MIN_SHARES} shares` };
         }
-        catch (fallbackError) {
-            console.error(`   ⚠️ Failed to check positions: ${error.message}`);
-            return { hasUp: false, hasDown: false, upBalance: 0, downBalance: 0 };
-        }
+        shares = MIN_SHARES;
+        reason = `minimum ${MIN_SHARES} shares`;
     }
+    const maxUpShares = Math.floor(upLiquidity * MAX_LIQUIDITY_PERCENT);
+    const maxDownShares = Math.floor(downLiquidity * MAX_LIQUIDITY_PERCENT);
+    const liquidityLimit = Math.min(maxUpShares, maxDownShares);
+    if (shares > liquidityLimit && liquidityLimit >= MIN_SHARES) {
+        shares = liquidityLimit;
+        reason = `limited by liquidity`;
+    }
+    if (shares < MIN_SHARES) {
+        return { shares: 0, reason: `insufficient liquidity` };
+    }
+    return { shares, reason };
 }
 /**
- * NOTE: Automatic reversal doesn't work on Polymarket!
- * Tokens need to settle before they can be sold.
- * Instead, we just report the exposure and block the market.
- * User must manually sell on polymarket.com
+ * Wait for a position to appear (order to fill)
  */
-function reportExposure(side, shares) {
-    console.log(`   🚨 ONE-SIDED EXPOSURE: ${shares} ${side} shares`);
-    console.log(`   ⚠️  Polymarket tokens need time to settle before selling`);
-    console.log(`   👉 MANUAL ACTION: Go to polymarket.com and sell your ${side} position`);
-    console.log(`   ⛔ Market BLOCKED to prevent further exposure`);
-}
-/**
- * BOTH OR NOTHING: Wait for both orders, check positions continuously
- * If we don't have both within 1 second, cancel everything and reverse any filled leg
- */
-async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId, shares, maxUpPrice, maxDownPrice) {
-    if (!upOrderId || !downOrderId) {
-        return { upFilled: false, downFilled: false, secondLegOrderId: null, reversed: false };
-    }
+async function waitForPosition(tokenId, otherTokenId, expectedShares, timeoutMs, side) {
     const startTime = Date.now();
-    let secondLegOrderId = null;
-    let marketOrderPlaced = false;
-    let lastPositionCheck = 0;
-    // IMMEDIATE first check: Check ORDER STATUS (fast)
-    const [upStatus, downStatus] = await Promise.all([
-        checkOrderStatus(upOrderId),
-        checkOrderStatus(downOrderId),
-    ]);
-    // Treat 'filled' or 'unknown' (404 = order removed, likely filled) as potentially filled
-    let upFilled = upStatus === 'filled' || upStatus === 'unknown';
-    let downFilled = downStatus === 'filled' || downStatus === 'unknown';
-    // Verify with positions (positions are the source of truth)
-    let positions = await checkPositions(upTokenId, downTokenId, shares);
-    let hasUpPos = positions.hasUp;
-    let hasDownPos = positions.hasDown;
-    console.log(`   [0ms] Order status: UP=${upStatus} DOWN=${downStatus} | Positions: UP=${positions.upBalance.toFixed(1)} DOWN=${positions.downBalance.toFixed(1)}`);
-    // BOTH FILLED - SUCCESS!
-    if (hasUpPos && hasDownPos) {
-        console.log(`   ✅ BOTH FILLED immediately!`);
-        await Promise.all([
-            cancelOrder(upOrderId),
-            cancelOrder(downOrderId),
-        ]);
-        return { upFilled: true, downFilled: true, secondLegOrderId: null, reversed: false };
-    }
-    // ONE-SIDED: Place market order IMMEDIATELY
-    if (hasUpPos && !hasDownPos && !marketOrderPlaced) {
-        console.log(`   ⚠️ UP filled but DOWN didn't - placing MARKET order for DOWN NOW...`);
-        marketOrderPlaced = true;
-        secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
-    }
-    else if (!hasUpPos && hasDownPos && !marketOrderPlaced) {
-        console.log(`   ⚠️ DOWN filled but UP didn't - placing MARKET order for UP NOW...`);
-        marketOrderPlaced = true;
-        secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
-    }
-    // Fast polling loop: check POSITIONS every 100ms (positions are source of truth)
-    while (Date.now() - startTime < MAX_WAIT_FOR_BOTH_MS) {
-        const elapsed = Date.now() - startTime;
-        // Check POSITIONS (source of truth - faster than order status API)
-        if (Date.now() - lastPositionCheck >= POSITION_CHECK_INTERVAL_MS) {
-            lastPositionCheck = Date.now();
-            positions = await checkPositions(upTokenId, downTokenId, shares);
-            hasUpPos = positions.hasUp;
-            hasDownPos = positions.hasDown;
-            // BOTH FILLED - SUCCESS!
-            if (hasUpPos && hasDownPos) {
-                console.log(`   [${elapsed}ms] ✅ BOTH POSITIONS - SUCCESS!`);
-                await Promise.all([
-                    cancelOrder(upOrderId),
-                    cancelOrder(downOrderId),
-                    secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
-                ]);
-                return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
-            }
-            // ONE-SIDED: Place market order if not already placed
-            if (hasUpPos && !hasDownPos && !marketOrderPlaced) {
-                console.log(`   [${elapsed}ms] ⚠️ UP filled - placing MARKET order for DOWN...`);
-                marketOrderPlaced = true;
-                secondLegOrderId = await placeMarketOrder(downTokenId, shares, Side.BUY, maxDownPrice);
-            }
-            else if (!hasUpPos && hasDownPos && !marketOrderPlaced) {
-                console.log(`   [${elapsed}ms] ⚠️ DOWN filled - placing MARKET order for UP...`);
-                marketOrderPlaced = true;
-                secondLegOrderId = await placeMarketOrder(upTokenId, shares, Side.BUY, maxUpPrice);
-            }
+    while (Date.now() - startTime < timeoutMs) {
+        const positions = await checkPositions(side === 'UP' ? tokenId : otherTokenId, side === 'DOWN' ? tokenId : otherTokenId, expectedShares);
+        if (side === 'DOWN' && positions.hasDown) {
+            return true;
         }
-        await new Promise(r => setTimeout(r, POLLING_DELAY_MS)); // Poll every 5ms (maximum speed)
+        if (side === 'UP' && positions.hasUp) {
+            return true;
+        }
+        await new Promise(r => setTimeout(r, POSITION_CHECK_INTERVAL_MS));
     }
-    // TIMEOUT: Final check - POSITIONS are source of truth
-    const finalPositions = await checkPositions(upTokenId, downTokenId, shares);
-    const finalHasUp = finalPositions.hasUp;
-    const finalHasDown = finalPositions.hasDown;
-    console.log(`   [TIMEOUT] Final positions: UP=${finalPositions.upBalance.toFixed(1)} (${finalHasUp ? 'YES' : 'NO'}) DOWN=${finalPositions.downBalance.toFixed(1)} (${finalHasDown ? 'YES' : 'NO'})`);
-    // BOTH - Success
-    if (finalHasUp && finalHasDown) {
-        console.log(`   ✅ BOTH POSITIONS at timeout - SUCCESS!`);
-        await Promise.all([
-            cancelOrder(upOrderId),
-            cancelOrder(downOrderId),
-            secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
-        ]);
-        return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
-    }
-    // ONE-SIDED OR NONE - Cancel unfilled orders
-    console.log(`   ❌ Don't have both - cancelling unfilled orders...`);
-    await Promise.all([
-        cancelOrder(upOrderId),
-        cancelOrder(downOrderId),
-        secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
-    ]);
-    // Check what we ended up with
-    let reversed = false;
-    if (finalHasUp && !finalHasDown) {
-        // ONE-SIDED: Have UP but no DOWN
-        reportExposure('UP', Math.floor(finalPositions.upBalance));
-        reversed = false; // Can't auto-reverse, user must handle
-    }
-    else if (!finalHasUp && finalHasDown) {
-        // ONE-SIDED: Have DOWN but no UP
-        reportExposure('DOWN', Math.floor(finalPositions.downBalance));
-        reversed = false; // Can't auto-reverse, user must handle
-    }
-    else if (!finalHasUp && !finalHasDown) {
-        // SAFE: Neither filled - no exposure
-        console.log(`   ✓ No positions - orders didn't fill (safe to retry)`);
-        reversed = true; // No exposure = safe
-    }
-    return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
+    return false;
 }
 /**
- * Execute arbitrage trade - buy both Up and Down in PARALLEL
+ * Execute arbitrage trade - SEQUENTIAL: DOWN first, then UP
  */
 export async function executeTrade(arb) {
     if (!clobClient || !wallet) {
@@ -470,19 +186,15 @@ export async function executeTrade(arb) {
         return null;
     }
     const now = Date.now();
-    // Use prices directly from scan (already execution prices from /price endpoint)
-    // No verification delay - execute immediately to catch fast-moving arbs
     const upPrice = arb.up_price;
     const downPrice = arb.down_price;
     const combinedCost = arb.combined_cost;
-    console.log(`\n💰 EXECUTING IMMEDIATELY: UP=$${upPrice.toFixed(3)} DOWN=$${downPrice.toFixed(3)} = $${combinedCost.toFixed(4)}`);
+    console.log(`\n💰 EXECUTING: UP=$${upPrice.toFixed(3)} DOWN=$${downPrice.toFixed(3)} = $${combinedCost.toFixed(4)}`);
     console.log(`   Liquidity: UP=${arb.up_shares_available.toFixed(0)} DOWN=${arb.down_shares_available.toFixed(0)}`);
-    // Check max combined cost protection
     if (combinedCost > MAX_COMBINED_COST) {
-        console.log(`   ❌ Combined cost $${combinedCost.toFixed(4)} exceeds max $${MAX_COMBINED_COST.toFixed(2)} - rejecting`);
+        console.log(`   ❌ Combined cost exceeds max - rejecting`);
         return null;
     }
-    // Calculate optimal size
     const balance = await getBalance();
     const { shares, reason } = calculateTradeSize(balance, combinedCost, arb.up_shares_available, arb.down_shares_available);
     if (shares < 1) {
@@ -492,7 +204,7 @@ export async function executeTrade(arb) {
     const costUsd = shares * combinedCost;
     const profitUsd = shares * (1.0 - combinedCost);
     console.log(`   ✓ Size: ${shares} shares (${reason})`);
-    // Step 3: Prepare trade record
+    console.log(`   Cost: $${costUsd.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
     const trade = {
         id: `trade-${now}`,
         market_id: arb.market_id,
@@ -513,153 +225,133 @@ export async function executeTrade(arb) {
         reversal_succeeded: false,
         has_exposure: false,
     };
-    console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
-    console.log(`   Cost: $${costUsd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
-    // Use scan prices directly but pay UP TO $0.99 combined to ensure fills
-    // Strategy: Set limit prices to max we're willing to pay per token
-    // If scan combined is $0.97, we have $0.02 room to spare
-    const room = MAX_COMBINED_COST - combinedCost; // Room before hitting 0.99
-    const bufferPerToken = Math.min(room / 2, 0.05); // Split room between tokens, max 5% each
-    let upMarketPrice = Math.min(upPrice + bufferPerToken, 0.95);
-    let downMarketPrice = Math.min(downPrice + bufferPerToken, 0.95);
-    let maxCombinedCost = upMarketPrice + downMarketPrice;
-    // Ensure we don't exceed $0.99 combined
-    if (maxCombinedCost > MAX_COMBINED_COST) {
-        const excess = maxCombinedCost - MAX_COMBINED_COST;
-        upMarketPrice = upMarketPrice - (excess / 2);
-        downMarketPrice = downMarketPrice - (excess / 2);
-        maxCombinedCost = upMarketPrice + downMarketPrice;
-    }
-    // Final safety check
-    if (maxCombinedCost > MAX_COMBINED_COST) {
-        console.log(`   ❌ Max combined cost $${maxCombinedCost.toFixed(4)} exceeds limit $${MAX_COMBINED_COST.toFixed(2)} - rejecting`);
-        return null;
-    }
-    console.log(`   Market orders: UP=$${upMarketPrice.toFixed(3)} DOWN=$${downMarketPrice.toFixed(3)} = $${maxCombinedCost.toFixed(4)}`);
+    // Calculate limit prices with buffer
+    const room = MAX_COMBINED_COST - combinedCost;
+    const bufferPerToken = Math.min(room / 2, 0.05);
+    let upLimitPrice = Math.min(upPrice + bufferPerToken, 0.95);
+    let downLimitPrice = Math.min(downPrice + bufferPerToken, 0.95);
+    console.log(`   Limits: UP=$${upLimitPrice.toFixed(3)} DOWN=$${downLimitPrice.toFixed(3)}`);
     try {
-        // Place BOTH orders simultaneously with aggressive limit prices
-        console.log(`   🚀 Placing BOTH orders simultaneously...`);
-        const [upResult, downResult] = await Promise.all([
-            clobClient.createAndPostOrder({
-                tokenID: arb.up_token_id,
-                price: upMarketPrice, // Aggressive limit to ensure fill
-                size: shares,
-                side: Side.BUY,
-            }).catch(err => ({ error: err })),
-            clobClient.createAndPostOrder({
-                tokenID: arb.down_token_id,
-                price: downMarketPrice, // Aggressive limit to ensure fill
-                size: shares,
-                side: Side.BUY,
-            }).catch(err => ({ error: err })),
-        ]);
-        // Check if orders were submitted
-        const upOrderId = upResult && !('error' in upResult) ? upResult.orderID : null;
+        // ========== STEP 1: Place DOWN order first ==========
+        console.log(`\n   🎯 STEP 1: Placing DOWN order...`);
+        const downResult = await clobClient.createAndPostOrder({
+            tokenID: arb.down_token_id,
+            price: downLimitPrice,
+            size: shares,
+            side: Side.BUY,
+        }).catch(err => ({ error: err }));
         const downOrderId = downResult && !('error' in downResult) ? downResult.orderID : null;
-        if (!upOrderId || !downOrderId) {
-            // One or both orders failed to submit - extract error message
-            let upErr = 'Unknown error';
-            let downErr = 'Unknown error';
-            if ('error' in upResult) {
-                const err = upResult.error;
-                upErr = err?.data?.error || err?.message || err?.toString() || 'Unknown error';
-            }
-            if ('error' in downResult) {
-                const err = downResult.error;
-                downErr = err?.data?.error || err?.message || err?.toString() || 'Unknown error';
-            }
-            if (!upOrderId) {
-                console.error(`   ❌ UP order submission failed: ${upErr}`);
-                // Check if it's the minimum size error
-                if (upErr.includes('minimum') || upErr.includes('Size')) {
-                    console.error(`   ⚠️  This is likely due to minimum 5 shares requirement`);
-                }
-            }
-            if (!downOrderId) {
-                console.error(`   ❌ DOWN order submission failed: ${downErr}`);
-                // Check if it's the minimum size error
-                if (downErr.includes('minimum') || downErr.includes('Size')) {
-                    console.error(`   ⚠️  This is likely due to minimum 5 shares requirement`);
-                }
-            }
+        if (!downOrderId) {
+            const err = downResult.error;
+            const errMsg = err?.data?.error || err?.message || 'Unknown';
+            console.log(`   ❌ DOWN order failed: ${errMsg}`);
             trade.status = 'failed';
-            trade.orders_placed = false; // Orders were NOT placed - safe to retry
-            trade.error = `Order submission failed: UP=${upOrderId ? 'ok' : upErr}, DOWN=${downOrderId ? 'ok' : downErr}`;
-            console.log(`   ❌ TRADE FAILED - Could not submit both orders`);
+            trade.error = `DOWN order failed: ${errMsg}`;
+            executedTrades.push(trade);
+            return trade;
+        }
+        trade.down_order_id = downOrderId;
+        trade.orders_placed = true;
+        console.log(`   ✓ DOWN order: ${downOrderId.slice(0, 16)}...`);
+        // ========== STEP 2: Wait for DOWN to fill ==========
+        console.log(`   ⏳ Waiting for DOWN to fill...`);
+        const downFilled = await waitForPosition(arb.down_token_id, arb.up_token_id, shares, FILL_TIMEOUT_MS, 'DOWN');
+        if (!downFilled) {
+            // DOWN didn't fill - cancel and exit (SAFE - no exposure)
+            console.log(`   ⏱️ DOWN didn't fill - cancelling...`);
+            await cancelOrder(downOrderId);
+            // Verify we don't have the position
+            const check = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
+            if (check.hasDown) {
+                // DOWN actually filled after timeout but before cancel!
+                console.log(`   ⚠️ DOWN filled just before cancel!`);
+                // Continue to place UP order
+            }
+            else {
+                console.log(`   ✓ DOWN cancelled - no exposure (safe to retry)`);
+                trade.status = 'failed';
+                trade.has_exposure = false;
+                trade.error = 'DOWN did not fill - cancelled';
+                executedTrades.push(trade);
+                return trade;
+            }
+        }
+        console.log(`   ✅ DOWN FILLED!`);
+        // ========== STEP 3: Place UP order ==========
+        console.log(`   🎯 STEP 2: Placing UP order...`);
+        const upResult = await clobClient.createAndPostOrder({
+            tokenID: arb.up_token_id,
+            price: upLimitPrice,
+            size: shares,
+            side: Side.BUY,
+        }).catch(err => ({ error: err }));
+        const upOrderId = upResult && !('error' in upResult) ? upResult.orderID : null;
+        if (!upOrderId) {
+            const err = upResult.error;
+            const errMsg = err?.data?.error || err?.message || 'Unknown';
+            console.log(`   ❌ UP order failed: ${errMsg}`);
+            console.log(`   🚨 EXPOSURE: Have ${shares} DOWN, no UP!`);
+            console.log(`   👉 MANUAL: Sell DOWN on polymarket.com`);
+            trade.up_order_id = null;
+            trade.status = 'failed';
+            trade.has_exposure = true;
+            trade.error = `Have DOWN but UP failed - sell DOWN manually`;
             executedTrades.push(trade);
             return trade;
         }
         trade.up_order_id = upOrderId;
-        trade.down_order_id = downOrderId;
-        trade.orders_placed = true; // CRITICAL: Orders are now live on the exchange
-        console.log(`   ✓ UP order submitted: ${upOrderId}`);
-        console.log(`   ✓ DOWN order submitted: ${downOrderId}`);
-        console.log(`   ⏳ Waiting for both orders to fill (max ${ORDER_FILL_TIMEOUT_MS / 1000}s)...`);
-        // Wait for both orders to fill, place market order for second leg if one fills
-        const { upFilled, downFilled, secondLegOrderId, reversed: waitReversed } = await waitForBothOrders(upOrderId, downOrderId, arb.up_token_id, arb.down_token_id, shares, upMarketPrice, downMarketPrice);
-        // Update order IDs if we placed a market order for second leg
-        if (secondLegOrderId) {
-            trade.down_order_id = secondLegOrderId;
-        }
-        // Final position check - this is the source of truth
+        console.log(`   ✓ UP order: ${upOrderId.slice(0, 16)}...`);
+        // ========== STEP 4: Wait for UP to fill ==========
+        console.log(`   ⏳ Waiting for UP to fill...`);
+        const upFilled = await waitForPosition(arb.up_token_id, arb.down_token_id, shares, FILL_TIMEOUT_MS, 'UP');
+        // Final check
         const finalCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
-        const hasBoth = finalCheck.hasUp && finalCheck.hasDown;
-        const hasOneSided = (finalCheck.hasUp && !finalCheck.hasDown) || (!finalCheck.hasUp && finalCheck.hasDown);
-        const hasNone = !finalCheck.hasUp && !finalCheck.hasDown;
-        // SUCCESS: Both positions confirmed
-        if (hasBoth) {
+        if (finalCheck.hasUp && finalCheck.hasDown) {
+            // SUCCESS!
+            console.log(`   ✅✅ BOTH FILLED - ARBITRAGE COMPLETE!`);
+            console.log(`   💰 Locked profit: $${profitUsd.toFixed(2)}`);
             trade.status = 'filled';
             trade.has_exposure = false;
-            trade.reversal_succeeded = false; // N/A
-            console.log(`   ✅ BOTH POSITIONS CONFIRMED - Profit locked: $${profitUsd.toFixed(2)}`);
             cachedBalance -= costUsd;
-            console.log(`   💵 Remaining balance: ~$${cachedBalance.toFixed(2)}`);
-            console.log(`   📊 Continuing to scan...\n`);
             executedTrades.push(trade);
             return trade;
         }
-        // DANGER: One-sided position - cannot auto-reverse on Polymarket
-        if (hasOneSided) {
-            trade.status = 'failed';
-            trade.reversal_succeeded = false;
-            trade.has_exposure = true; // We have unhedged exposure
-            if (finalCheck.hasUp && !finalCheck.hasDown) {
-                trade.error = `ONE-SIDED: ${finalCheck.upBalance.toFixed(0)} UP shares - sell manually on polymarket.com`;
-                reportExposure('UP', Math.floor(finalCheck.upBalance));
+        if (finalCheck.hasDown && !finalCheck.hasUp) {
+            // Have DOWN but not UP
+            console.log(`   ⚠️ UP didn't fill - cancelling...`);
+            await cancelOrder(upOrderId);
+            // Check again
+            const recheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
+            if (recheck.hasUp && recheck.hasDown) {
+                console.log(`   ✅ UP filled just before cancel - SUCCESS!`);
+                trade.status = 'filled';
+                trade.has_exposure = false;
+                executedTrades.push(trade);
+                return trade;
             }
-            else {
-                trade.error = `ONE-SIDED: ${finalCheck.downBalance.toFixed(0)} DOWN shares - sell manually on polymarket.com`;
-                reportExposure('DOWN', Math.floor(finalCheck.downBalance));
-            }
-            executedTrades.push(trade);
-            return trade;
-        }
-        // NO POSITIONS: Orders never filled (or were cancelled)
-        if (hasNone) {
+            console.log(`   🚨 EXPOSURE: Have ${recheck.downBalance.toFixed(0)} DOWN, ${recheck.upBalance.toFixed(0)} UP`);
+            console.log(`   👉 MANUAL: Balance positions on polymarket.com`);
             trade.status = 'failed';
-            trade.error = 'Orders did not fill';
-            trade.reversal_succeeded = true; // No exposure = success
-            trade.has_exposure = false;
-            console.log(`   ℹ️ No positions - orders didn't fill (can retry)`);
-            console.log(`   📊 Continuing to scan...\n`);
+            trade.has_exposure = true;
+            trade.error = `Imbalanced: ${recheck.downBalance.toFixed(0)} DOWN, ${recheck.upBalance.toFixed(0)} UP`;
             executedTrades.push(trade);
             return trade;
         }
-    }
-    catch (error) {
+        // Unexpected state
+        console.log(`   ⚠️ Unexpected: UP=${finalCheck.upBalance} DOWN=${finalCheck.downBalance}`);
         trade.status = 'failed';
-        trade.error = error.message;
-        trade.has_exposure = false; // Unknown state, assume safe but log error
-        trade.reversal_succeeded = false;
-        console.error(`   ❌ TRADE ERROR: ${error.message}`);
-        console.log(`   📊 Continuing to scan...\n`);
+        trade.has_exposure = finalCheck.hasUp || finalCheck.hasDown;
+        trade.error = `Unexpected state`;
         executedTrades.push(trade);
         return trade;
     }
-    // Should not reach here - all cases above should return
-    console.warn(`   ⚠️ Unexpected code path - trade state unknown`);
-    executedTrades.push(trade);
-    return trade;
+    catch (error) {
+        console.error(`   ❌ ERROR: ${error.message}`);
+        trade.status = 'failed';
+        trade.error = error.message;
+        executedTrades.push(trade);
+        return trade;
+    }
 }
 /**
  * Get all executed trades

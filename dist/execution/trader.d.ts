@@ -1,12 +1,12 @@
 /**
- * Real Trade Execution - Optimized
+ * Real Trade Execution - SEQUENTIAL STRATEGY
  *
- * Features:
- * - Parallel order execution
- * - Dynamic sizing (% of balance)
- * - Liquidity-aware (don't move the market)
- * - Slippage protection
- * - Price verification before execution
+ * NEW APPROACH: DOWN first, then UP
+ * - Place DOWN order first (historically harder to fill)
+ * - Wait for DOWN to fill
+ * - ONLY then place UP order
+ * - If DOWN doesn't fill, cancel and retry (no exposure)
+ * - If DOWN fills but UP doesn't, we have DOWN exposure (report it)
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -39,7 +39,7 @@ export declare function initializeTrader(): Promise<boolean>;
  */
 export declare function getBalance(): Promise<number>;
 /**
- * Execute arbitrage trade - buy both Up and Down in PARALLEL
+ * Execute arbitrage trade - SEQUENTIAL: DOWN first, then UP
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 /**
