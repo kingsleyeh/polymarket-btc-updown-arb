@@ -137,6 +137,55 @@ async function cancelOrder(orderId: string): Promise<void> {
 }
 
 /**
+ * Sell position to reverse exposure
+ * Waits for settlement then market sells
+ */
+async function sellPosition(tokenId: string, shares: number, label: string): Promise<boolean> {
+  if (!clobClient || shares <= 0) return false;
+  
+  console.log(`   🔄 Waiting 2s for token settlement...`);
+  await new Promise(r => setTimeout(r, 2000)); // Wait for settlement
+  
+  try {
+    // Sell at low price to ensure fill (market sell)
+    const sellPrice = 0.01; // Very low price = market sell
+    
+    console.log(`   📤 Selling ${shares} ${label} @ $${sellPrice}...`);
+    
+    const result = await clobClient.createAndPostOrder({
+      tokenID: tokenId,
+      price: sellPrice,
+      size: shares,
+      side: Side.SELL,
+    }).catch(e => ({ error: e }));
+    
+    const orderId = result && !('error' in result) ? (result as any).orderID : null;
+    
+    if (!orderId) {
+      const err = (result as any)?.error;
+      console.log(`   ❌ Sell failed: ${err?.data?.error || err?.message || 'Unknown'}`);
+      return false;
+    }
+    
+    // Wait for sell to fill
+    await new Promise(r => setTimeout(r, 1000));
+    
+    // Check if position is gone
+    const remaining = await getPosition(tokenId);
+    if (remaining === 0) {
+      console.log(`   ✅ Sold all ${label} - back to 0 exposure`);
+      return true;
+    } else {
+      console.log(`   ⚠️ Still have ${remaining} ${label} remaining`);
+      return false;
+    }
+  } catch (error: any) {
+    console.log(`   ❌ Sell error: ${error.message}`);
+    return false;
+  }
+}
+
+/**
  * Wait for position to appear
  */
 async function waitForPosition(tokenId: string, minShares: number, timeoutMs: number): Promise<number> {
@@ -277,13 +326,28 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     
     if (!upOrderId) {
       console.log(`   ❌ UP order failed to submit`);
-      console.log(`   🚨 Have ${afterDown.down} DOWN, ${afterDown.up} UP!`);
-      marketsWithExposure.add(arb.market_id);
-      trade.has_exposure = true;
-      trade.can_retry = false;
-      trade.error = `UP order failed - have ${afterDown.down} DOWN, ${afterDown.up} UP`;
-      executedTrades.push(trade);
-      return trade;
+      console.log(`   🚨 Have ${afterDown.down} DOWN, ${afterDown.up} UP - attempting reversal...`);
+      
+      // Try to sell the DOWN we just bought
+      const sold = await sellPosition(arb.down_token_id, newDownShares, 'DOWN');
+      
+      const checkAfterSell = await getBothPositions(arb.up_token_id, arb.down_token_id);
+      if (checkAfterSell.up === checkAfterSell.down) {
+        console.log(`   ✅ Reversal successful - back to balanced (can retry)`);
+        trade.has_exposure = false;
+        trade.can_retry = true;
+        trade.error = 'UP failed, reversed DOWN';
+        executedTrades.push(trade);
+        return trade;
+      } else {
+        console.log(`   ❌ Reversal failed - manual intervention needed`);
+        marketsWithExposure.add(arb.market_id);
+        trade.has_exposure = true;
+        trade.can_retry = false;
+        trade.error = `Reversal failed: ${checkAfterSell.up} UP, ${checkAfterSell.down} DOWN`;
+        executedTrades.push(trade);
+        return trade;
+      }
     }
     console.log(`   ✓ UP order placed`);
 
@@ -311,31 +375,77 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
       return trade;
     }
 
-    // Imbalanced - block forever
+    // Imbalanced - attempt auto-reversal
     console.log(`   🚨 IMBALANCED: ${finalPos.up} UP ≠ ${finalPos.down} DOWN`);
-    console.log(`   👉 Fix on polymarket.com`);
-    marketsWithExposure.add(arb.market_id);
-    trade.has_exposure = true;
-    trade.can_retry = false;
-    trade.shares = Math.max(finalPos.up, finalPos.down);
-    trade.error = `Imbalanced: ${finalPos.up} UP, ${finalPos.down} DOWN`;
-    executedTrades.push(trade);
-    return trade;
+    console.log(`   🔄 Attempting auto-reversal to 0...`);
+    
+    // Sell everything to get back to 0
+    let reversed = true;
+    if (finalPos.up > 0) {
+      const soldUp = await sellPosition(arb.up_token_id, finalPos.up, 'UP');
+      if (!soldUp) reversed = false;
+    }
+    if (finalPos.down > 0) {
+      const soldDown = await sellPosition(arb.down_token_id, finalPos.down, 'DOWN');
+      if (!soldDown) reversed = false;
+    }
+    
+    // Check final state
+    const afterReversal = await getBothPositions(arb.up_token_id, arb.down_token_id);
+    
+    if (afterReversal.up === 0 && afterReversal.down === 0) {
+      console.log(`   ✅ Reversal successful - back to 0 (can retry)`);
+      trade.has_exposure = false;
+      trade.can_retry = true;
+      trade.error = 'Imbalanced but reversed to 0';
+      executedTrades.push(trade);
+      return trade;
+    } else if (afterReversal.up === afterReversal.down) {
+      console.log(`   ✅ Positions balanced: ${afterReversal.up} each (can retry)`);
+      trade.has_exposure = false;
+      trade.can_retry = true;
+      trade.error = 'Balanced after reversal';
+      executedTrades.push(trade);
+      return trade;
+    } else {
+      console.log(`   ❌ Reversal failed: ${afterReversal.up} UP, ${afterReversal.down} DOWN`);
+      console.log(`   👉 Manual fix on polymarket.com`);
+      marketsWithExposure.add(arb.market_id);
+      trade.has_exposure = true;
+      trade.can_retry = false;
+      trade.shares = Math.max(afterReversal.up, afterReversal.down);
+      trade.error = `Reversal failed: ${afterReversal.up} UP, ${afterReversal.down} DOWN`;
+      executedTrades.push(trade);
+      return trade;
+    }
 
   } catch (error: any) {
     console.error(`   ❌ Error: ${error.message}`);
     
-    // Check final positions to determine if we can retry
+    // Check positions
     const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     
     if (finalPos.up === finalPos.down) {
       trade.can_retry = true;
       trade.error = error.message;
+      executedTrades.push(trade);
+      return trade;
+    }
+    
+    // Imbalanced - try reversal
+    console.log(`   🔄 Error caused imbalance, attempting reversal...`);
+    if (finalPos.up > 0) await sellPosition(arb.up_token_id, finalPos.up, 'UP');
+    if (finalPos.down > 0) await sellPosition(arb.down_token_id, finalPos.down, 'DOWN');
+    
+    const afterReversal = await getBothPositions(arb.up_token_id, arb.down_token_id);
+    if (afterReversal.up === afterReversal.down) {
+      trade.can_retry = true;
+      trade.error = `Error reversed: ${error.message}`;
     } else {
       marketsWithExposure.add(arb.market_id);
       trade.has_exposure = true;
       trade.can_retry = false;
-      trade.error = `Error + imbalance: ${finalPos.up} UP, ${finalPos.down} DOWN`;
+      trade.error = `Error + reversal failed: ${afterReversal.up} UP, ${afterReversal.down} DOWN`;
     }
     
     executedTrades.push(trade);
