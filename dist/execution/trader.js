@@ -10,10 +10,10 @@ import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 // Configuration
 const MIN_SHARES = 5;
-const MAX_COMBINED_COST = 0.99;
+const MAX_COMBINED_COST = 0.995; // Allow up to 99.5 cents
 const FILL_TIMEOUT_MS = 3000;
 const POSITION_CHECK_INTERVAL_MS = 200;
-const PRICE_BUFFER = 0.15; // 15% above market
+const PRICE_BUFFER = 0.03; // 3% above market (enough to fill, still profitable)
 // Polymarket
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
