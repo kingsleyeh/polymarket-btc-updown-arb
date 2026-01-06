@@ -227,25 +227,29 @@ class BTCUpDownArbBot {
           // EXECUTE REAL TRADE
           const trade = await executeTrade(arb);
           
-          // STRICT RULE: ONE ATTEMPT PER MARKET - NO RETRIES
-          // This ensures we never accumulate imbalanced positions
-          // If anything goes wrong, block the market forever
-          
-          // ALWAYS block market after any trade attempt
-          this.executedMarkets.add(market.id);
+          // RULE: Only block if we have exposure (imbalanced position)
+          // If nothing filled, we can safely retry
           
           if (trade) {
             if (trade.status === 'filled') {
-              log(`✅ SUCCESS - Both legs filled equally!`);
+              // SUCCESS - block market (we're done with it)
+              this.executedMarkets.add(market.id);
+              log(`✅ SUCCESS - ${trade.shares} UP = ${trade.shares} DOWN`);
+              log(`   💰 Profit locked - market complete`);
             } else if (trade.has_exposure) {
+              // DANGER - we have imbalanced position, block to prevent making it worse
+              this.executedMarkets.add(market.id);
               log(`🚨 EXPOSURE: ${trade.error}`);
               log(`   👉 Go to polymarket.com and balance your position`);
+              log(`   ⛔ Market BLOCKED - cannot retry with exposure`);
             } else {
-              log(`⚠️ Trade failed: ${trade.error || 'Unknown'}`);
+              // Nothing filled - safe to retry
+              log(`⚠️ Trade failed: ${trade.error || 'No fills'}`);
+              log(`   ✓ No exposure - can retry on next scan`);
             }
-            log(`   ⛔ Market BLOCKED - No retries allowed`);
           } else {
-            log(`⚠️ Trade rejected - Market BLOCKED anyway (one attempt only)`);
+            // Trade was null (rejected before orders placed) - safe to retry
+            log(`⚠️ Trade rejected before execution - can retry`);
           }
           
           // RELEASE LOCKS (done processing this attempt)
