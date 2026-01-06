@@ -1,11 +1,9 @@
 /**
- * MARKET MAKER ENTRY POINT - Dual Strategy
+ * MARKET MAKER - Multi-Market
  *
- * Runs ONE market at a time:
- *   - LIVE (≤15 min to expiry): 3% edge target
- *   - PREMARKET (15-30 min to expiry): 2% edge target
- *
- * After completing a trade → hold until expiry → scan for next market
+ * Watches and trades BOTH markets simultaneously:
+ *   - LIVE (≤15 min to expiry): 3% edge
+ *   - PREMARKET (15-30 min to expiry): 2% edge
  *
  * Run with: npm run mm
  */
