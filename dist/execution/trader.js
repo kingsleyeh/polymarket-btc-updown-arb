@@ -106,34 +106,34 @@ async function placeAndWaitForFill(tokenId, shares, price, label) {
             console.log(`   ❌ ${label} order failed: ${err?.data?.error || err?.message || 'Unknown'}`);
             return 0;
         }
-        console.log(`   ⏳ ${label}: Waiting for fill...`);
-        // Poll for position change (balance API has delay)
-        let filled = 0;
-        const pollStart = Date.now();
-        const maxWait = 5000; // 5 seconds max
-        const pollInterval = 500; // Check every 500ms
-        while (Date.now() - pollStart < maxWait) {
-            await new Promise(r => setTimeout(r, pollInterval));
-            const currentPos = await getPosition(tokenId);
-            filled = currentPos - startPos;
-            if (filled >= shares) {
-                console.log(`   ✓ ${label}: Filled ${filled} shares`);
-                break;
-            }
-            if (filled > 0) {
-                console.log(`   ⏳ ${label}: Partial ${filled}/${shares}...`);
-            }
-        }
-        // Cancel any remaining order
+        console.log(`   ⏳ ${label}: Order placed, waiting...`);
+        // Wait for order to process, then cancel unfilled portion
+        await new Promise(r => setTimeout(r, FILL_TIMEOUT_MS));
+        // Cancel any remaining
         try {
             await clobClient.cancelOrder({ orderID: orderId });
         }
         catch { }
-        // Final position check (one more time after cancel)
-        await new Promise(r => setTimeout(r, 500));
+        // Check order status to see how much filled
+        let filledFromOrder = 0;
+        try {
+            const order = await clobClient.getOrder(orderId);
+            if (order) {
+                const sizeFilled = parseFloat(order.size_matched || '0');
+                filledFromOrder = Math.floor(sizeFilled);
+                console.log(`   📋 ${label}: Order status says ${filledFromOrder} filled`);
+            }
+        }
+        catch (e) {
+            console.log(`   ⚠️ Could not get order status`);
+        }
+        // ALSO check position (belt and suspenders)
+        await new Promise(r => setTimeout(r, 2000)); // Wait 2s for balance to update
         const finalPos = await getPosition(tokenId);
-        filled = finalPos - startPos;
-        console.log(`   📊 ${label}: Final ${filled} shares (was ${startPos}, now ${finalPos})`);
+        const filledFromPos = finalPos - startPos;
+        // Use the HIGHER of the two (order status vs position)
+        const filled = Math.max(filledFromOrder, filledFromPos);
+        console.log(`   📊 ${label}: Order says ${filledFromOrder}, Position says ${filledFromPos}, using ${filled}`);
         return filled;
     }
     catch (error) {
