@@ -29,7 +29,7 @@ export async function scanBTCUpDownMarkets() {
                 closed: false,
                 limit: 20,
             },
-            timeout: 2000, // Maximum speed - 2s timeout
+            timeout: 5000, // 5s timeout for market discovery
         });
         for (const event of response.data || []) {
             const market = event.markets?.[0];

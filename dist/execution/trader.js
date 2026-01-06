@@ -16,13 +16,14 @@ const TRADE_SIZE_PERCENT = 0.10; // 10% of available balance per trade
 const MIN_SHARES = 5; // Polymarket requires minimum 5 shares per order
 const MAX_LIQUIDITY_PERCENT = 0.30; // Don't take more than 30% of available liquidity
 const MAX_COMBINED_COST = 0.99; // Maximum acceptable combined cost (reject if exceeds)
-const MARKET_ORDER_SLIPPAGE = 0.02; // 2% - use aggressive limit prices that act like market orders
+const MARKET_ORDER_SLIPPAGE = 0.03; // 3% - aggressive to ensure fills
 const PRICE_VERIFY_TOLERANCE = 0.02; // 2% - reject if price moved more than this
-const ORDER_FILL_TIMEOUT_MS = 300; // 300ms MAX - maximum speed
-const ORDER_CHECK_INTERVAL_MS = 5; // Check every 5ms (maximum speed)
-const POSITION_CHECK_INTERVAL_MS = 5; // Check actual positions every 5ms (maximum speed)
-const MAX_WAIT_FOR_BOTH_MS = 300; // Maximum 300ms - if not both, reverse immediately
-const POLLING_DELAY_MS = 5; // Polling delay 5ms (maximum speed)
+const ORDER_FILL_TIMEOUT_MS = 2000; // 2s to wait for orders to fill
+const ORDER_CHECK_INTERVAL_MS = 50; // Check every 50ms
+const POSITION_CHECK_INTERVAL_MS = 50; // Check positions every 50ms
+const MAX_WAIT_FOR_BOTH_MS = 2000; // 2s max wait for both orders
+const POLLING_DELAY_MS = 50; // Polling delay 50ms
+const API_TIMEOUT_MS = 2000; // 2s timeout for API calls (can't be too short!)
 // Polymarket
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -310,11 +311,11 @@ async function checkPositions(upTokenId, downTokenId, expectedShares) {
             const [upResp, downResp] = await Promise.all([
                 axios.get(`${CLOB_HOST}/balance`, {
                     params: { token_id: upTokenId },
-                    timeout: 100, // Maximum speed - 100ms timeout
+                    timeout: API_TIMEOUT_MS,
                 }).catch(() => ({ data: { balance: '0' } })),
                 axios.get(`${CLOB_HOST}/balance`, {
                     params: { token_id: downTokenId },
-                    timeout: 100, // Maximum speed - 100ms timeout
+                    timeout: API_TIMEOUT_MS,
                 }).catch(() => ({ data: { balance: '0' } })),
             ]);
             const upBal = parseFloat(upResp.data?.balance || '0') / 1_000_000;
@@ -338,10 +339,10 @@ async function reversePosition(tokenId, shares) {
     // Retry up to 3 times
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            // Get current price to sell at market (maximum speed)
+            // Get current price to sell at market
             const priceResp = await axios.get(`${CLOB_HOST}/price`, {
                 params: { token_id: tokenId, side: 'sell' },
-                timeout: 100, // Maximum speed - 100ms timeout
+                timeout: API_TIMEOUT_MS,
             });
             const sellPrice = parseFloat(priceResp.data?.price || '0');
             if (sellPrice === 0) {
@@ -362,8 +363,8 @@ async function reversePosition(tokenId, shares) {
             });
             if (order.orderID) {
                 console.log(`   ✓ Reversal order placed: ${order.orderID}`);
-                // Wait briefly and verify it filled (maximum speed)
-                await new Promise(r => setTimeout(r, POLLING_DELAY_MS * 2)); // 10ms
+                // Wait briefly and verify it filled
+                await new Promise(r => setTimeout(r, 200)); // 200ms to let order process
                 const orderStatus = await checkOrderStatus(order.orderID);
                 if (orderStatus === 'filled') {
                     return true;
@@ -563,17 +564,19 @@ export async function executeTrade(arb) {
     };
     console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
     console.log(`   Cost: $${costUsd.toFixed(2)} | Payout: $${trade.guaranteed_payout.toFixed(2)} | Profit: $${profitUsd.toFixed(2)}`);
-    // Use scan prices directly (they're already from /price endpoint = execution prices)
-    // Add small 3% buffer to ensure immediate fills - keep it simple like it was working
-    const SIMPLE_BUFFER = 0.03; // 3% - enough to fill, not too aggressive
-    let upMarketPrice = Math.min(upPrice * (1 + SIMPLE_BUFFER), 0.99);
-    let downMarketPrice = Math.min(downPrice * (1 + SIMPLE_BUFFER), 0.99);
+    // Use scan prices directly but pay UP TO $0.99 combined to ensure fills
+    // Strategy: Set limit prices to max we're willing to pay per token
+    // If scan combined is $0.97, we have $0.02 room to spare
+    const room = MAX_COMBINED_COST - combinedCost; // Room before hitting 0.99
+    const bufferPerToken = Math.min(room / 2, 0.05); // Split room between tokens, max 5% each
+    let upMarketPrice = Math.min(upPrice + bufferPerToken, 0.95);
+    let downMarketPrice = Math.min(downPrice + bufferPerToken, 0.95);
     let maxCombinedCost = upMarketPrice + downMarketPrice;
-    // If exceeds limit, scale down proportionally
+    // Ensure we don't exceed $0.99 combined
     if (maxCombinedCost > MAX_COMBINED_COST) {
-        const scaleFactor = MAX_COMBINED_COST / maxCombinedCost;
-        upMarketPrice = upMarketPrice * scaleFactor;
-        downMarketPrice = downMarketPrice * scaleFactor;
+        const excess = maxCombinedCost - MAX_COMBINED_COST;
+        upMarketPrice = upMarketPrice - (excess / 2);
+        downMarketPrice = downMarketPrice - (excess / 2);
         maxCombinedCost = upMarketPrice + downMarketPrice;
     }
     // Final safety check

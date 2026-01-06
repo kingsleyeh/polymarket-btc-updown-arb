@@ -164,19 +164,18 @@ class BTCUpDownArbBot {
                     this.tradingMarkets.add(market.id);
                     // EXECUTE REAL TRADE
                     const trade = await executeTrade(arb);
-                    // CRITICAL: Only mark as executed if trade SUCCEEDED (both legs filled)
-                    // If trade failed, don't mark as executed - we can retry
+                    // CRITICAL: Mark as executed if ANY orders were placed
+                    // This prevents accumulating one-sided positions from retries
                     if (trade) {
                         if (trade.status === 'filled') {
-                            // Trade succeeded - mark as executed (maintains $5 exposure rule)
                             this.executedMarkets.add(market.id);
-                            log(`✅ Trade SUCCESS - Both legs completed - Market marked as executed`);
+                            log(`✅ Trade SUCCESS - Both legs filled!`);
                         }
-                        else if (trade.up_order_id && trade.down_order_id) {
-                            // Orders were placed but trade failed - DON'T mark as executed
-                            // This allows retry if arb persists (orders might have been cancelled/reversed)
-                            log(`⚠️ Trade ${trade.status}: ${trade.error || 'Unknown error'}`);
-                            log(`   Orders were placed but didn't complete - Will retry if arb persists`);
+                        else if (trade.up_order_id || trade.down_order_id) {
+                            // ORDERS WERE PLACED - mark as executed to prevent accumulation!
+                            this.executedMarkets.add(market.id);
+                            log(`⚠️ Trade ${trade.status}: ${trade.error || 'Incomplete'}`);
+                            log(`   ⛔ Market blocked - NO MORE RETRIES (orders were placed)`);
                         }
                         else {
                             // Orders were NOT placed - can retry
@@ -184,7 +183,7 @@ class BTCUpDownArbBot {
                         }
                     }
                     else {
-                        // Trade was null (rejected before execution)
+                        // Trade was null (rejected before execution) - can retry
                         log(`⚠️ Trade rejected before execution - Can retry if arb persists`);
                     }
                     // Remove from trading set (done processing this attempt)
