@@ -117,7 +117,7 @@ async function placeAndWaitForFill(tokenId: string, shares: number, price: numbe
   const takePrice = Math.min(price + 0.01, 0.99);
   const startPos = await getPosition(tokenId);
   
-  console.log(`   📥 ${label}: Buying ${shares} @ $${takePrice.toFixed(3)}...`);
+  console.log(`   📥 ${label}: Buying ${shares} @ $${takePrice.toFixed(3)} (start: ${startPos})...`);
   
   try {
     const result = await clobClient.createAndPostOrder({
@@ -130,23 +130,45 @@ async function placeAndWaitForFill(tokenId: string, shares: number, price: numbe
     const orderId = result && !('error' in result) ? (result as any).orderID : null;
     
     if (!orderId) {
-      console.log(`   ❌ ${label} order failed`);
+      const err = (result as any)?.error;
+      console.log(`   ❌ ${label} order failed: ${err?.data?.error || err?.message || 'Unknown'}`);
       return 0;
     }
     
-    // Wait for fill
-    await new Promise(r => setTimeout(r, FILL_TIMEOUT_MS));
+    console.log(`   ⏳ ${label}: Waiting for fill...`);
     
-    // Cancel any remaining
+    // Poll for position change (balance API has delay)
+    let filled = 0;
+    const pollStart = Date.now();
+    const maxWait = 5000; // 5 seconds max
+    const pollInterval = 500; // Check every 500ms
+    
+    while (Date.now() - pollStart < maxWait) {
+      await new Promise(r => setTimeout(r, pollInterval));
+      const currentPos = await getPosition(tokenId);
+      filled = currentPos - startPos;
+      
+      if (filled >= shares) {
+        console.log(`   ✓ ${label}: Filled ${filled} shares`);
+        break;
+      }
+      
+      if (filled > 0) {
+        console.log(`   ⏳ ${label}: Partial ${filled}/${shares}...`);
+      }
+    }
+    
+    // Cancel any remaining order
     try {
       await clobClient.cancelOrder({ orderID: orderId });
     } catch {}
     
-    // Check how many we got
-    const endPos = await getPosition(tokenId);
-    const filled = endPos - startPos;
+    // Final position check (one more time after cancel)
+    await new Promise(r => setTimeout(r, 500));
+    const finalPos = await getPosition(tokenId);
+    filled = finalPos - startPos;
     
-    console.log(`   ✓ ${label}: Got ${filled} shares`);
+    console.log(`   📊 ${label}: Final ${filled} shares (was ${startPos}, now ${finalPos})`);
     return filled;
     
   } catch (error: any) {
