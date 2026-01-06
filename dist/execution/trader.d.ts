@@ -1,10 +1,8 @@
 /**
- * SEQUENTIAL Execution - ONLY way to guarantee UP = DOWN
+ * FAST MARKET ORDER Execution
  *
- * 1. Place DOWN order, wait for fill
- * 2. Check EXACTLY how many DOWN we got
- * 3. Place UP order for EXACTLY that amount
- * 4. If imbalanced, reverse to 0
+ * TRUE market orders: buy at $0.99 to take ANY available ask
+ * Minimal waits - speed is everything
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -19,7 +17,7 @@ interface ExecutedTrade {
 export declare function canTradeMarket(marketId: string): boolean;
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * SEQUENTIAL EXECUTE - Guarantees UP = DOWN
+ * FAST SEQUENTIAL EXECUTE
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {
