@@ -487,15 +487,34 @@ async function updateQuotes(): Promise<void> {
   
   // VOLATILITY FILTER: Skip if UP or DOWN >= 80¢
   if (upAsk.price >= CONFIG.VOLATILITY_THRESHOLD || downAsk.price >= CONFIG.VOLATILITY_THRESHOLD) {
-    if (state.status === 'QUOTING') {
-      console.log(`   ⏸️  High volatility: UP=$${upAsk.price.toFixed(2)}, DOWN=$${downAsk.price.toFixed(2)} - pausing`);
-      await cancelAllOrders();
-      state.status = 'IDLE';
-      state.upOrderId = null;
-      state.downOrderId = null;
-    } else {
-      console.log(`   ⏸️  Volatility skip: UP=$${upAsk.price.toFixed(2)}, DOWN=$${downAsk.price.toFixed(2)}`);
+    console.log(`   ⏸️  Volatility: UP=$${upAsk.price.toFixed(2)}, DOWN=$${downAsk.price.toFixed(2)}`);
+    
+    // ALWAYS cancel orders when volatility hits
+    await cancelAllOrders();
+    
+    // Check if we have a one-sided position that needs handling
+    const upPos = await getPosition(state.upTokenId);
+    const downPos = await getPosition(state.downTokenId);
+    
+    if ((upPos > 0 && downPos === 0) || (upPos === 0 && downPos > 0)) {
+      console.log(`   ⚠️ One-sided fill during volatility: ${upPos} UP, ${downPos} DOWN`);
+      // Handle one-sided fill
+      if (upPos > 0 && downPos === 0) {
+        state.status = 'ONE_SIDED_UP';
+        state.upPosition = upPos;
+        await handleOneSidedFill('UP', state.upBidPrice || upAsk.price, upPos);
+      } else {
+        state.status = 'ONE_SIDED_DOWN';
+        state.downPosition = downPos;
+        await handleOneSidedFill('DOWN', state.downBidPrice || downAsk.price, downPos);
+      }
+      return;
     }
+    
+    // No position - just reset state
+    state.status = 'IDLE';
+    state.upOrderId = null;
+    state.downOrderId = null;
     return; // Skip - too volatile
   }
   
