@@ -10,10 +10,9 @@ import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 // Configuration
 const MIN_SHARES = 5;
-const MAX_COMBINED_COST = 0.995; // Allow up to 99.5 cents
 const FILL_TIMEOUT_MS = 3000;
 const POSITION_CHECK_INTERVAL_MS = 200;
-const PRICE_BUFFER = 0.03; // 3% above market (enough to fill, still profitable)
+const PRICE_BUFFER_CENTS = 0.01; // Add 1 cent to each side to help fill
 // Polymarket
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -203,16 +202,9 @@ export async function executeTrade(arb) {
         executedTrades.push(trade);
         return trade;
     }
-    // Calculate prices with buffer
-    const downLimit = Math.min(arb.down_price * (1 + PRICE_BUFFER), 0.95);
-    const upLimit = Math.min(arb.up_price * (1 + PRICE_BUFFER), 0.95);
-    if (downLimit + upLimit > MAX_COMBINED_COST) {
-        console.log(`   ❌ Prices too high after buffer`);
-        trade.error = 'Prices too high';
-        trade.can_retry = true; // Prices might improve
-        executedTrades.push(trade);
-        return trade;
-    }
+    // Use scan prices + tiny buffer (1 cent each side)
+    const downLimit = Math.min(arb.down_price + PRICE_BUFFER_CENTS, 0.99);
+    const upLimit = Math.min(arb.up_price + PRICE_BUFFER_CENTS, 0.99);
     console.log(`   💵 Limits: DOWN=$${downLimit.toFixed(3)} UP=$${upLimit.toFixed(3)}`);
     try {
         // ===== STEP 1: Place DOWN order =====
