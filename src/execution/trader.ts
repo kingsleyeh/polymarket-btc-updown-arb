@@ -79,6 +79,9 @@ export async function initializeTrader(): Promise<boolean> {
 /**
  * Get the REAL ask price from order book to fill N shares
  * Returns price and available liquidity
+ * 
+ * NOTE: Polymarket asks are sorted DESCENDING (highest first)
+ * So we need to read from the END to get best (lowest) asks
  */
 async function getOrderBookAsk(tokenId: string, sharesNeeded: number, label: string): Promise<{price: number, available: number} | null> {
   if (!clobClient) return null;
@@ -86,37 +89,38 @@ async function getOrderBookAsk(tokenId: string, sharesNeeded: number, label: str
   try {
     const book = await clobClient.getOrderBook(tokenId);
     
-    // DEBUG: Log raw order book structure
-    console.log(`   📖 ${label} book: ${book.asks?.length || 0} asks, ${book.bids?.length || 0} bids`);
-    if (book.asks && book.asks.length > 0) {
-      console.log(`   📖 ${label} best ask: $${book.asks[0].price} (${book.asks[0].size} shares)`);
-    }
-    
     if (!book || !book.asks || book.asks.length === 0) {
       console.log(`   ⚠️ ${label}: No asks in order book`);
       return null;
     }
     
-    // Asks are sorted lowest first (best ask first)
-    // Walk through asks to find price for our shares
-    let sharesAccum = 0;
-    let worstPrice = 0;
+    // Asks are sorted DESCENDING (highest/worst first, lowest/best last)
+    // Reverse to get best asks first
+    const sortedAsks = [...book.asks].reverse();
     
-    for (const ask of book.asks) {
+    const bestAsk = sortedAsks[0];
+    console.log(`   📖 ${label}: Best ask $${bestAsk.price} (${parseFloat(bestAsk.size).toFixed(1)} shares)`);
+    
+    // Walk through asks (now sorted best-first) to find price for our shares
+    let sharesAccum = 0;
+    let worstPriceNeeded = 0;
+    
+    for (const ask of sortedAsks) {
       const askPrice = parseFloat(ask.price);
       const askSize = parseFloat(ask.size);
       
       sharesAccum += askSize;
-      worstPrice = askPrice;
+      worstPriceNeeded = askPrice;
       
       if (sharesAccum >= sharesNeeded) {
-        // We have enough liquidity at this price level
-        return { price: worstPrice, available: sharesAccum };
+        // We have enough liquidity
+        return { price: worstPriceNeeded, available: sharesAccum };
       }
     }
     
-    // Not enough liquidity - return what's available at worst price
-    return { price: worstPrice, available: sharesAccum };
+    // Not enough liquidity at any price
+    console.log(`   ⚠️ ${label}: Only ${sharesAccum.toFixed(1)} shares available`);
+    return { price: worstPriceNeeded, available: sharesAccum };
   } catch (error: any) {
     console.log(`   ❌ ${label} order book error: ${error.message}`);
     return null;
