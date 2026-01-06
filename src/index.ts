@@ -49,6 +49,7 @@ class BTCUpDownArbBot {
   private startTime: number = Date.now();
   private executedMarkets: Set<string> = new Set(); // Markets we've successfully traded
   private tradingMarkets: Set<string> = new Set(); // Markets currently being traded (lock)
+  private isExecutingTrade: boolean = false; // GLOBAL LOCK - only one trade at a time
 
   /**
    * Initialize the bot
@@ -166,8 +167,15 @@ class BTCUpDownArbBot {
     let bestCombined = 999;
 
     for (const market of this.markets) {
-      // Skip if we already executed on this market
+      // FIRST CHECK: Skip if already executed or currently trading (BEFORE any async work)
       if (this.executedMarkets.has(market.id)) {
+        continue;
+      }
+      if (this.tradingMarkets.has(market.id)) {
+        continue;
+      }
+      // GLOBAL LOCK: Only one trade execution at a time across ALL scan cycles
+      if (this.isExecutingTrade) {
         continue;
       }
 
@@ -191,13 +199,15 @@ class BTCUpDownArbBot {
         const arb = checkArbitrage(market, prices);
 
         if (arb) {
-          // Skip if already executed or currently trading
+          // DOUBLE CHECK after price fetch (another cycle might have started trading)
           if (this.executedMarkets.has(market.id)) {
-            continue; // Already traded this market successfully
+            continue;
           }
-          
           if (this.tradingMarkets.has(market.id)) {
-            continue; // Already trading this market - skip to prevent duplicates
+            continue;
+          }
+          if (this.isExecutingTrade) {
+            continue;
           }
 
           arbsThisCycle++;
@@ -210,8 +220,9 @@ class BTCUpDownArbBot {
           log(`   Up=$${prices.up_price.toFixed(3)} + Down=$${prices.down_price.toFixed(3)} = $${arb.combined_cost.toFixed(4)}`);
           log(`   Edge: ${profit}% | Expiry in: ${timeToExpiry} minutes`);
 
-          // Mark as trading IMMEDIATELY to prevent duplicate attempts
+          // ACQUIRE BOTH LOCKS before executing
           this.tradingMarkets.add(market.id);
+          this.isExecutingTrade = true; // GLOBAL LOCK
 
           // EXECUTE REAL TRADE
           const trade = await executeTrade(arb);
@@ -252,8 +263,9 @@ class BTCUpDownArbBot {
             log(`⚠️ Trade rejected before execution - Can retry if arb persists`);
           }
           
-          // Remove from trading set (done processing this attempt)
+          // RELEASE LOCKS (done processing this attempt)
           this.tradingMarkets.delete(market.id);
+          this.isExecutingTrade = false; // Release global lock
           
           if (trade) {
             // Update dashboard
@@ -271,6 +283,9 @@ class BTCUpDownArbBot {
         updateArbTracking(market.id, arb, prices);
 
       } catch (error: any) {
+        // ALWAYS release locks on error
+        this.tradingMarkets.delete(market.id);
+        this.isExecutingTrade = false;
         // Silent errors
       }
     }
