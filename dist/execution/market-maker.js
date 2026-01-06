@@ -72,9 +72,13 @@ async function getPosition(tokenId) {
             asset_type: AssetType.CONDITIONAL,
             token_id: tokenId,
         });
-        return Math.floor(parseFloat(bal.balance || '0') / 1_000_000);
+        // Balance is returned in smallest unit (like wei), divide by 1e6 to get shares
+        const rawBalance = bal.balance || '0';
+        const shares = Math.floor(parseFloat(rawBalance) / 1_000_000);
+        return shares;
     }
-    catch {
+    catch (error) {
+        console.log(`   ⚠️ Error reading position for ${tokenId.slice(0, 8)}...: ${error.message}`);
         return 0;
     }
 }
@@ -245,11 +249,23 @@ async function cutLoss(side, shares) {
         return;
     const tokenId = side === 'UP' ? state.upTokenId : state.downTokenId;
     console.log(`   📤 Selling ${shares} ${side} to cut loss`);
+    console.log(`   🔍 Token ID: ${tokenId.slice(0, 16)}...`);
     await cancelAllOrders();
     await new Promise(r => setTimeout(r, 1000)); // Wait for settlement
     // Get current position before selling
     const initialPos = await getPosition(tokenId);
-    console.log(`   📊 Current position: ${initialPos} shares`);
+    console.log(`   📊 Current position: ${initialPos} shares (requested to sell: ${shares})`);
+    // Also check the other side to see full picture
+    const otherTokenId = side === 'UP' ? state.downTokenId : state.upTokenId;
+    const otherPos = await getPosition(otherTokenId);
+    console.log(`   📊 Other side position: ${otherPos} ${side === 'UP' ? 'DOWN' : 'UP'}`);
+    if (initialPos === 0) {
+        console.log(`   ✅ No position to close`);
+        stats.cutLosses++;
+        state.status = 'IDLE';
+        state.tradesCut++;
+        return;
+    }
     // Try selling multiple times if needed
     for (let attempt = 1; attempt <= CONFIG.CUT_LOSS_MAX_ATTEMPTS; attempt++) {
         const currentPos = await getPosition(tokenId);
@@ -293,6 +309,17 @@ async function cutLoss(side, shares) {
     state.status = 'IDLE'; // Don't block, just continue
     state.tradesCut++;
 }
+async function hasOpenOrders() {
+    if (!clobClient)
+        return false;
+    try {
+        const orders = await clobClient.getOpenOrders();
+        return orders && orders.length > 0;
+    }
+    catch {
+        return false;
+    }
+}
 async function updateQuotes() {
     if (!state || !clobClient)
         return;
@@ -316,14 +343,34 @@ async function updateQuotes() {
         }
         return;
     }
+    // Check if we already have open orders
+    const hasOrders = await hasOpenOrders();
     // Check if prices changed significantly (>0.5%)
-    const priceChanged = Math.abs(prices.upBid - state.upBidPrice) > 0.005 ||
+    const priceChanged = state.upBidPrice === 0 || // First time placing
+        state.downBidPrice === 0 || // First time placing
+        Math.abs(prices.upBid - state.upBidPrice) > 0.005 ||
         Math.abs(prices.downBid - state.downBidPrice) > 0.005;
-    if (state.status === 'QUOTING' && !priceChanged) {
+    // Don't place if we're already quoting with same prices and orders exist
+    if (state.status === 'QUOTING' && hasOrders && !priceChanged) {
         return; // No need to update
     }
+    // Don't place if we're IDLE but already have orders (might be from previous run)
+    if (state.status === 'IDLE' && hasOrders) {
+        // Check if these are our orders by checking positions
+        const upPos = await getPosition(state.upTokenId);
+        const downPos = await getPosition(state.downTokenId);
+        // If we have positions, we might have filled orders - don't place new ones yet
+        if (upPos > 0 || downPos > 0) {
+            return; // Wait for position handling
+        }
+        // Otherwise, cancel and place fresh orders
+        await cancelAllOrders();
+    }
     // Cancel existing orders and place new ones
-    await cancelAllOrders();
+    if (hasOrders) {
+        await cancelAllOrders();
+        await new Promise(r => setTimeout(r, 500)); // Brief wait after cancel
+    }
     console.log(`\n   📊 Market: UP ask=$${upAsk.price.toFixed(3)}, DOWN ask=$${downAsk.price.toFixed(3)} (combined $${(upAsk.price + downAsk.price).toFixed(4)})`);
     console.log(`   📝 Quoting: UP bid=$${prices.upBid.toFixed(3)}, DOWN bid=$${prices.downBid.toFixed(3)} (target $${CONFIG.TARGET_COMBINED})`);
     const [upOrderId, downOrderId] = await Promise.all([
@@ -337,10 +384,11 @@ async function updateQuotes() {
         state.downBidPrice = prices.downBid;
         state.status = 'QUOTING';
         stats.quotesPlaced++;
-        console.log(`   ✓ Orders placed`);
+        console.log(`   ✓ Orders placed (UP: ${upOrderId.slice(0, 8)}..., DOWN: ${downOrderId.slice(0, 8)}...)`);
     }
     else {
         console.log(`   ❌ Failed to place orders`);
+        state.status = 'IDLE';
     }
 }
 async function checkFills() {
