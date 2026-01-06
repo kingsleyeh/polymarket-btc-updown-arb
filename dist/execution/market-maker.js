@@ -84,11 +84,18 @@ async function getPosition(tokenId) {
 }
 async function cancelAllOrders() {
     if (!clobClient)
-        return;
+        return false;
     try {
         await clobClient.cancelAll();
+        // Wait a bit for cancellation to process
+        await new Promise(r => setTimeout(r, 500));
+        // Verify cancellation
+        const orders = await clobClient.getOpenOrders();
+        return !orders || orders.length === 0;
     }
-    catch { }
+    catch {
+        return false;
+    }
 }
 async function placeLimitBuy(tokenId, shares, price) {
     if (!clobClient)
@@ -196,7 +203,18 @@ async function handleOneSidedFill(filledSide, filledPrice, filledShares) {
         else {
             console.log(`   ⚠️ Completing pair (${Math.abs(profitPct).toFixed(2)}% loss - acceptable)`);
         }
-        await cancelAllOrders();
+        // Cancel all orders and verify before placing aggressive complete
+        const cancelled = await cancelAllOrders();
+        if (!cancelled) {
+            console.log(`   ⚠️  Failed to cancel orders before aggressive complete`);
+            await new Promise(r => setTimeout(r, 1000));
+            const retryCancelled = await cancelAllOrders();
+            if (!retryCancelled) {
+                console.log(`   ❌ Cannot cancel orders - aborting aggressive complete`);
+                await cutLoss(filledSide, filledShares);
+                return;
+            }
+        }
         // Place aggressive complete order and track it
         const completeOrderId = await placeLimitBuy(otherTokenId, filledShares, otherAsk.price + 0.01);
         if (completeOrderId) {
@@ -373,22 +391,36 @@ async function updateQuotes() {
     if (state.status === 'QUOTING' && hasOrders && !priceChanged) {
         return; // No need to update
     }
-    // Don't place if we're IDLE but already have orders (might be from previous run)
-    if (state.status === 'IDLE' && hasOrders) {
+    // CRITICAL: Never place new orders if old ones still exist
+    if (hasOrders) {
         // Check if these are our orders by checking positions
         const upPos = await getPosition(state.upTokenId);
         const downPos = await getPosition(state.downTokenId);
         // If we have positions, we might have filled orders - don't place new ones yet
         if (upPos > 0 || downPos > 0) {
+            console.log(`   ⏸️  Waiting: ${upPos} UP, ${downPos} DOWN positions exist`);
             return; // Wait for position handling
         }
-        // Otherwise, cancel and place fresh orders
-        await cancelAllOrders();
-    }
-    // Cancel existing orders and place new ones
-    if (hasOrders) {
-        await cancelAllOrders();
-        await new Promise(r => setTimeout(r, 500)); // Brief wait after cancel
+        // Cancel and VERIFY cancellation before placing new orders
+        console.log(`   🧹 Cancelling existing orders...`);
+        const cancelled = await cancelAllOrders();
+        if (!cancelled) {
+            // Still have orders - retry cancellation
+            console.log(`   ⚠️  Orders still exist, retrying cancellation...`);
+            await new Promise(r => setTimeout(r, 1000));
+            const retryCancelled = await cancelAllOrders();
+            if (!retryCancelled) {
+                console.log(`   ❌ Failed to cancel orders - skipping quote update`);
+                return; // Don't place new orders if old ones still exist!
+            }
+        }
+        // Double-check no orders exist
+        const stillHasOrders = await hasOpenOrders();
+        if (stillHasOrders) {
+            console.log(`   ❌ Orders still exist after cancellation - aborting`);
+            return;
+        }
+        console.log(`   ✅ All orders cancelled`);
     }
     console.log(`\n   📊 Market: UP ask=$${upAsk.price.toFixed(3)}, DOWN ask=$${downAsk.price.toFixed(3)} (combined $${(upAsk.price + downAsk.price).toFixed(4)})`);
     console.log(`   📝 Quoting: UP bid=$${prices.upBid.toFixed(3)}, DOWN bid=$${prices.downBid.toFixed(3)} (target $${CONFIG.TARGET_COMBINED})`);
@@ -397,6 +429,16 @@ async function updateQuotes() {
         placeLimitBuy(state.downTokenId, CONFIG.SHARES_PER_ORDER, prices.downBid),
     ]);
     if (upOrderId && downOrderId) {
+        // Verify we only have 2 orders (the ones we just placed)
+        await new Promise(r => setTimeout(r, 500)); // Brief wait for orders to register
+        const orderList = await clobClient.getOpenOrders();
+        const orderCount = orderList?.length || 0;
+        if (orderCount > 2) {
+            console.log(`   ⚠️  WARNING: ${orderCount} orders exist (expected 2) - cancelling and retrying`);
+            await cancelAllOrders();
+            state.status = 'IDLE';
+            return; // Don't update state, retry next iteration
+        }
         state.upOrderId = upOrderId;
         state.downOrderId = downOrderId;
         state.upBidPrice = prices.upBid;
