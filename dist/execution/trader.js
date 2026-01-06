@@ -7,8 +7,7 @@
 import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 const MIN_SHARES = 5;
-const ORDER_WAIT_MS = 1500; // 1.5s wait for fill
-const SETTLEMENT_WAIT_MS = 1500;
+const SETTLEMENT_WAIT_MS = 1500; // Only needed for sells (token settlement)
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
 let clobClient = null;
@@ -80,13 +79,14 @@ async function cancelAllOrders() {
     catch { }
 }
 /**
- * TRUE MARKET BUY - price $0.99 takes any ask
+ * TRUE MARKET BUY - price $0.99 takes any ask INSTANTLY
  */
 async function marketBuy(tokenId, shares, label) {
     if (!clobClient)
         return { orderId: null, filled: 0 };
+    const startTime = Date.now();
     const startPos = await getPosition(tokenId);
-    console.log(`   📥 ${label}: MARKET BUY ${shares} @ $0.99`);
+    console.log(`   📥 ${label}: MARKET BUY ${shares}`);
     try {
         const result = await clobClient.createAndPostOrder({
             tokenID: tokenId,
@@ -95,19 +95,14 @@ async function marketBuy(tokenId, shares, label) {
             side: Side.BUY,
         }).catch(e => ({ error: e }));
         const orderId = result && !('error' in result) ? result.orderID : null;
+        const orderTime = Date.now() - startTime;
         if (!orderId) {
             const err = result?.error;
-            console.log(`   ❌ ${label}: Order failed - ${err?.data?.error || err?.message || 'Unknown'}`);
+            console.log(`   ❌ ${label}: Failed (${orderTime}ms) - ${err?.data?.error || err?.message || 'Unknown'}`);
             return { orderId: null, filled: 0 };
         }
-        // Wait for fill
-        await new Promise(r => setTimeout(r, ORDER_WAIT_MS));
-        // Cancel unfilled
-        try {
-            await clobClient.cancelOrder({ orderID: orderId });
-        }
-        catch { }
-        // Check filled from order status
+        // Market orders fill instantly - check immediately
+        // Try order status first (most accurate)
         let filled = 0;
         try {
             const order = await clobClient.getOrder(orderId);
@@ -116,12 +111,18 @@ async function marketBuy(tokenId, shares, label) {
             }
         }
         catch { }
-        // Also check position
-        const endPos = await getPosition(tokenId);
-        const positionFilled = endPos - startPos;
-        // Use higher
-        filled = Math.max(filled, positionFilled);
-        console.log(`   ✓ ${label}: Got ${filled} shares`);
+        // Cancel any unfilled remainder
+        try {
+            await clobClient.cancelOrder({ orderID: orderId });
+        }
+        catch { }
+        // Double-check with position if order status showed 0
+        if (filled === 0) {
+            const endPos = await getPosition(tokenId);
+            filled = endPos - startPos;
+        }
+        const totalTime = Date.now() - startTime;
+        console.log(`   ✓ ${label}: ${filled} shares (${totalTime}ms)`);
         return { orderId, filled };
     }
     catch (error) {
