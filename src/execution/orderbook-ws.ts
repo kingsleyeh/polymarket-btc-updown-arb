@@ -221,6 +221,27 @@ export function getPriceForShares(tokenId: string, sharesNeeded: number, label: 
 }
 
 /**
+ * Get best bid price from cached order book
+ * Returns null if no cache or no bids
+ */
+export function getBestBid(tokenId: string): { price: number; size: number } | null {
+  const book = getCachedOrderBook(tokenId);
+  
+  if (!book || !book.bids || book.bids.length === 0) {
+    return null;
+  }
+  
+  // Bids should be sorted descending (highest first = best for selling)
+  const sortedBids = [...book.bids].sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+  const bestBid = sortedBids[0];
+  
+  return {
+    price: parseFloat(bestBid.price),
+    size: parseFloat(bestBid.size),
+  };
+}
+
+/**
  * Check if we have fresh cached data for both tokens
  */
 export function hasFreshCache(upTokenId: string, downTokenId: string): boolean {

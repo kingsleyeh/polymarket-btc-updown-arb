@@ -40,6 +40,14 @@ export declare function getPriceForShares(tokenId: string, sharesNeeded: number,
     available: number;
 } | null;
 /**
+ * Get best bid price from cached order book
+ * Returns null if no cache or no bids
+ */
+export declare function getBestBid(tokenId: string): {
+    price: number;
+    size: number;
+} | null;
+/**
  * Check if we have fresh cached data for both tokens
  */
 export declare function hasFreshCache(upTokenId: string, downTokenId: string): boolean;
