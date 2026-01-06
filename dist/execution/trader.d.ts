@@ -1,9 +1,11 @@
 /**
- * SIMPLIFIED Trade Execution
+ * ORDER BOOK TAKER Execution
  *
- * 1. Market buy both sides IMMEDIATELY
- * 2. Auto-reverse any imbalance
- * 3. Retry until success or manual intervention needed
+ * When arb spotted:
+ * 1. Fetch order books for UP and DOWN
+ * 2. See what ASK prices are available (what sellers are offering)
+ * 3. TAKE that liquidity immediately (market buy at ask)
+ * 4. Auto-reverse any imbalance
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -15,16 +17,10 @@ interface ExecutedTrade {
     can_retry: boolean;
     error?: string;
 }
-/**
- * Check if market can be traded
- */
 export declare function canTradeMarket(marketId: string): boolean;
-/**
- * Initialize trader
- */
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * Execute trade - SIMPLE VERSION
+ * Execute trade - ORDER BOOK TAKER
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {
