@@ -21,7 +21,7 @@ import {
   resetStats,
 } from './crypto/arb-logger';
 import { startDashboardServer, pushLog, updateStats } from './dashboard/server';
-import { initializeTrader, executeTrade, getExecutionStats, isTraderReady } from './execution/trader';
+import { initializeTrader, executeTrade, getExecutionStats, isTraderReady, canTradeMarket } from './execution/trader';
 import { UpDownMarket } from './types/arbitrage';
 import { SCAN_INTERVAL_MS, MIN_EDGE, EXPIRY_CUTOFF_SECONDS } from './config/constants';
 
@@ -47,8 +47,6 @@ class BTCUpDownArbBot {
   private markets: UpDownMarket[] = [];
   private scanCount: number = 0;
   private startTime: number = Date.now();
-  private executedMarkets: Set<string> = new Set(); // Markets we've successfully traded
-  private tradingMarkets: Set<string> = new Set(); // Markets currently being traded (lock)
   private isExecutingTrade: boolean = false; // GLOBAL LOCK - only one trade at a time
 
   /**
@@ -125,13 +123,6 @@ class BTCUpDownArbBot {
     // Refresh markets every 30 seconds
     setInterval(async () => {
       this.markets = await scanBTCUpDownMarkets();
-      // Clear executed markets when new market window starts
-      if (this.markets.length > 0) {
-        const currentMarketId = this.markets[0].id;
-        if (!this.executedMarkets.has(currentMarketId)) {
-          this.executedMarkets.clear();
-        }
-      }
       updateStats({ marketsCount: this.markets.length });
     }, 30 * 1000);
 
@@ -167,11 +158,8 @@ class BTCUpDownArbBot {
     let bestCombined = 999;
 
     for (const market of this.markets) {
-      // FIRST CHECK: Skip if already executed or currently trading (BEFORE any async work)
-      if (this.executedMarkets.has(market.id)) {
-        continue;
-      }
-      if (this.tradingMarkets.has(market.id)) {
+      // Skip if market is blocked (has exposure or completed)
+      if (!canTradeMarket(market.id)) {
         continue;
       }
       // GLOBAL LOCK: Only one trade execution at a time across ALL scan cycles
@@ -200,10 +188,7 @@ class BTCUpDownArbBot {
 
         if (arb) {
           // DOUBLE CHECK after price fetch (another cycle might have started trading)
-          if (this.executedMarkets.has(market.id)) {
-            continue;
-          }
-          if (this.tradingMarkets.has(market.id)) {
+          if (!canTradeMarket(market.id)) {
             continue;
           }
           if (this.isExecutingTrade) {
@@ -220,43 +205,31 @@ class BTCUpDownArbBot {
           log(`   Up=$${prices.up_price.toFixed(3)} + Down=$${prices.down_price.toFixed(3)} = $${arb.combined_cost.toFixed(4)}`);
           log(`   Edge: ${profit}% | Expiry in: ${timeToExpiry} minutes`);
 
-          // ACQUIRE BOTH LOCKS before executing
-          this.tradingMarkets.add(market.id);
-          this.isExecutingTrade = true; // GLOBAL LOCK
+          // ACQUIRE GLOBAL LOCK
+          this.isExecutingTrade = true;
 
-          // EXECUTE REAL TRADE
+          // EXECUTE TRADE (market gets locked inside executeTrade)
           const trade = await executeTrade(arb);
           
-          // RULE: Only block if we have exposure (imbalanced position)
-          // If nothing filled, we can safely retry
+          // RELEASE GLOBAL LOCK
+          this.isExecutingTrade = false;
           
+          // Log result
           if (trade) {
             if (trade.status === 'filled') {
-              // SUCCESS - block market (we're done with it)
-              this.executedMarkets.add(market.id);
               log(`✅ SUCCESS - ${trade.shares} UP = ${trade.shares} DOWN`);
-              log(`   💰 Profit locked - market complete`);
+              log(`   💰 Profit locked!`);
             } else if (trade.has_exposure) {
-              // DANGER - we have imbalanced position, block to prevent making it worse
-              this.executedMarkets.add(market.id);
               log(`🚨 EXPOSURE: ${trade.error}`);
-              log(`   👉 Go to polymarket.com and balance your position`);
-              log(`   ⛔ Market BLOCKED - cannot retry with exposure`);
+              log(`   👉 Go to polymarket.com NOW`);
+              log(`   ⛔ Market BLOCKED - no more attempts`);
+            } else if (trade.can_retry) {
+              log(`⚠️ Trade failed: ${trade.error || 'Unknown'}`);
+              log(`   ✓ Can retry on next arb opportunity`);
             } else {
-              // Nothing filled - safe to retry
-              log(`⚠️ Trade failed: ${trade.error || 'No fills'}`);
-              log(`   ✓ No exposure - can retry on next scan`);
+              log(`⚠️ Trade failed: ${trade.error || 'Unknown'}`);
             }
-          } else {
-            // Trade was null (rejected before orders placed) - safe to retry
-            log(`⚠️ Trade rejected before execution - can retry`);
-          }
-          
-          // RELEASE LOCKS (done processing this attempt)
-          this.tradingMarkets.delete(market.id);
-          this.isExecutingTrade = false; // Release global lock
-          
-          if (trade) {
+            
             // Update dashboard
             const execStats = getExecutionStats();
             updateStats({
@@ -272,8 +245,7 @@ class BTCUpDownArbBot {
         updateArbTracking(market.id, arb, prices);
 
       } catch (error: any) {
-        // ALWAYS release locks on error
-        this.tradingMarkets.delete(market.id);
+        // ALWAYS release global lock on error
         this.isExecutingTrade = false;
         // Silent errors
       }
