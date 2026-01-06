@@ -230,7 +230,15 @@ async function handleOneSidedFill(state: MarketState, filledSide: 'UP' | 'DOWN',
   const otherSide = filledSide === 'UP' ? 'DOWN' : 'UP';
   const otherTokenId = filledSide === 'UP' ? state.downTokenId : state.upTokenId;
   
-  console.log(`   [${state.strategy}] ⚠️ ONE-SIDED FILL: ${filledSide} @ $${filledPrice.toFixed(3)}`);
+  console.log(`   [${state.strategy}] ⚠️ ONE-SIDED FILL: ${filledSide} @ $${filledPrice.toFixed(3)} (${filledShares} shares)`);
+  
+  // CRITICAL: Only complete up to SHARES_PER_ORDER (5 shares), not the full position
+  // If we have more than 5 shares, something went wrong (duplicate orders?)
+  const sharesToComplete = Math.min(filledShares, CONFIG.SHARES_PER_ORDER);
+  
+  if (filledShares > CONFIG.SHARES_PER_ORDER) {
+    console.log(`   [${state.strategy}] ⚠️ WARNING: Position has ${filledShares} shares (expected ${CONFIG.SHARES_PER_ORDER}) - only completing ${sharesToComplete}`);
+  }
   
   const otherAsk = getBestAsk(otherTokenId);
   
@@ -257,7 +265,8 @@ async function handleOneSidedFill(state: MarketState, filledSide: 'UP' | 'DOWN',
     await cancelAllOrders();
     state.status = 'AGGRESSIVE_COMPLETE';
     
-    const completeOrderId = await placeLimitBuy(otherTokenId, filledShares, otherAsk.price + 0.01);
+    // Only complete up to SHARES_PER_ORDER (5 shares)
+    const completeOrderId = await placeLimitBuy(otherTokenId, sharesToComplete, otherAsk.price + 0.01);
     
     if (completeOrderId) {
       console.log(`   [${state.strategy}] ⏳ Waiting up to ${CONFIG.AGGRESSIVE_COMPLETE_WAIT_MS / 1000}s for fill...`);
@@ -454,7 +463,7 @@ async function processMarket(state: MarketState): Promise<void> {
     return;
   }
   
-  // ALWAYS check positions first - don't place new quotes if we have unresolved positions
+  // ALWAYS check positions first
   const upPos = await getPosition(state.upTokenId);
   const downPos = await getPosition(state.downTokenId);
   
@@ -462,7 +471,7 @@ async function processMarket(state: MarketState): Promise<void> {
   state.upPosition = upPos;
   state.downPosition = downPos;
   
-  // Both filled
+  // Both filled - set to HOLDING, don't trade again
   if (upPos >= CONFIG.SHARES_PER_ORDER && downPos >= CONFIG.SHARES_PER_ORDER) {
     const profit = (1 - (state.upBidPrice + state.downBidPrice)) * Math.min(upPos, downPos);
     console.log(`   [${state.strategy}] ✅✅ BOTH FILLED! ${upPos} UP + ${downPos} DOWN`);
@@ -475,21 +484,33 @@ async function processMarket(state: MarketState): Promise<void> {
     return;
   }
   
-  // One-sided fill - handle immediately, don't place new quotes
+  // One-sided position - handle it, but then set to HOLDING (don't trade again)
   if (upPos > 0 && downPos === 0) {
-    console.log(`   [${state.strategy}] ⚠️ One-sided UP position detected: ${upPos} UP, 0 DOWN`);
+    console.log(`   [${state.strategy}] ⚠️ One-sided UP position: ${upPos} UP, 0 DOWN`);
     stats.oneSidedFills++;
     const upAsk = getBestAsk(state.upTokenId);
     await handleOneSidedFill(state, 'UP', state.upBidPrice || (upAsk?.price || 0.5), upPos);
+    // After handling, always set to HOLDING (don't trade this market again)
+    state.status = 'HOLDING';
     return;
   }
   
   if (downPos > 0 && upPos === 0) {
-    console.log(`   [${state.strategy}] ⚠️ One-sided DOWN position detected: 0 UP, ${downPos} DOWN`);
+    console.log(`   [${state.strategy}] ⚠️ One-sided DOWN position: 0 UP, ${downPos} DOWN`);
     stats.oneSidedFills++;
     const downAsk = getBestAsk(state.downTokenId);
     await handleOneSidedFill(state, 'DOWN', state.downBidPrice || (downAsk?.price || 0.5), downPos);
+    // After handling, always set to HOLDING (don't trade this market again)
+    state.status = 'HOLDING';
     return;
+  }
+  
+  // CRITICAL: If we have ANY position (even partial), we've already traded - DON'T TRADE AGAIN
+  if (upPos > 0 || downPos > 0) {
+    console.log(`   [${state.strategy}] 📦 Position exists (${upPos} UP, ${downPos} DOWN) - holding, no more trading`);
+    state.status = 'HOLDING';
+    await cancelAllOrders();
+    return; // Don't place new quotes if we already have a position
   }
   
   // Get prices for new quotes (only if no positions)
