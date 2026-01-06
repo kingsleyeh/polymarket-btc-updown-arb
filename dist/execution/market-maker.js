@@ -197,43 +197,59 @@ async function handleOneSidedFill(filledSide, filledPrice, filledShares) {
             console.log(`   ⚠️ Completing pair (${Math.abs(profitPct).toFixed(2)}% loss - acceptable)`);
         }
         await cancelAllOrders();
-        const success = await marketBuy(otherTokenId, filledShares, otherAsk.price + 0.01);
-        if (success) {
-            // Wait for fill
-            await new Promise(r => setTimeout(r, 2000));
-            await cancelAllOrders(); // Cancel any remaining orders
-            await new Promise(r => setTimeout(r, 1000));
-            const upPos = await getPosition(state.upTokenId);
-            const downPos = await getPosition(state.downTokenId);
-            console.log(`   📊 Positions: ${upPos} UP, ${downPos} DOWN`);
-            if (upPos > 0 && downPos > 0 && Math.abs(upPos - downPos) <= 1) {
-                const minShares = Math.min(upPos, downPos);
-                const actualProfit = (1 - wouldPayCombined) * minShares;
-                console.log(`   ✅✅ COMPLETE! ${minShares} shares each`);
-                if (actualProfit > 0) {
-                    console.log(`   💰 Locked profit: $${actualProfit.toFixed(2)} (${profitPct.toFixed(2)}%)`);
+        // Place aggressive complete order and track it
+        const completeOrderId = await placeLimitBuy(otherTokenId, filledShares, otherAsk.price + 0.01);
+        if (completeOrderId) {
+            console.log(`   📝 Placed ${otherSide} order: ${completeOrderId.slice(0, 8)}...`);
+            state.status = 'AGGRESSIVE_COMPLETE';
+            state.aggressiveCompleteOrderId = completeOrderId;
+            // Wait for fill (poll multiple times)
+            let filled = false;
+            for (let i = 0; i < 5; i++) {
+                await new Promise(r => setTimeout(r, 1000));
+                const upPos = await getPosition(state.upTokenId);
+                const downPos = await getPosition(state.downTokenId);
+                console.log(`   📊 Positions (check ${i + 1}/5): ${upPos} UP, ${downPos} DOWN`);
+                if (upPos > 0 && downPos > 0 && Math.abs(upPos - downPos) <= 1) {
+                    const minShares = Math.min(upPos, downPos);
+                    const actualProfit = (1 - wouldPayCombined) * minShares;
+                    console.log(`   ✅✅ COMPLETE! ${minShares} shares each`);
+                    if (actualProfit > 0) {
+                        console.log(`   💰 Locked profit: $${actualProfit.toFixed(2)} (${profitPct.toFixed(2)}%)`);
+                    }
+                    else {
+                        console.log(`   💰 Small loss: $${Math.abs(actualProfit).toFixed(2)} (${Math.abs(profitPct).toFixed(2)}%)`);
+                    }
+                    await cancelAllOrders(); // Cancel any remaining orders
+                    stats.aggressiveCompletes++;
+                    if (actualProfit > 0) {
+                        stats.totalProfit += actualProfit;
+                    }
+                    else {
+                        stats.totalLoss += Math.abs(actualProfit);
+                    }
+                    state.status = 'COMPLETE';
+                    state.aggressiveCompleteOrderId = null;
+                    state.tradesCompleted++;
+                    state.totalPnL += actualProfit;
+                    filled = true;
+                    break;
                 }
-                else {
-                    console.log(`   💰 Small loss: $${Math.abs(actualProfit).toFixed(2)} (${Math.abs(profitPct).toFixed(2)}%)`);
-                }
-                stats.aggressiveCompletes++;
-                if (actualProfit > 0) {
-                    stats.totalProfit += actualProfit;
-                }
-                else {
-                    stats.totalLoss += Math.abs(actualProfit);
-                }
-                state.status = 'COMPLETE';
-                state.tradesCompleted++;
-                state.totalPnL += actualProfit;
             }
-            else {
-                console.log(`   ⚠️ Positions don't match - may need cleanup`);
-                state.status = 'IDLE';
+            if (!filled) {
+                // Check if order is still open
+                const hasOpen = await hasOpenOrders();
+                if (hasOpen) {
+                    console.log(`   ⚠️ Aggressive complete order still open - cancelling and cutting loss`);
+                    await cancelAllOrders();
+                }
+                console.log(`   ❌ Aggressive complete didn't fill - cutting loss`);
+                state.aggressiveCompleteOrderId = null;
+                await cutLoss(filledSide, filledShares);
             }
         }
         else {
-            console.log(`   ❌ Failed to buy ${otherSide} - cutting loss`);
+            console.log(`   ❌ Failed to place ${otherSide} order - cutting loss`);
             await cutLoss(filledSide, filledShares);
         }
     }
@@ -322,6 +338,9 @@ async function hasOpenOrders() {
 }
 async function updateQuotes() {
     if (!state || !clobClient)
+        return;
+    // Don't place new quotes if we're in the middle of aggressive complete
+    if (state.status === 'AGGRESSIVE_COMPLETE')
         return;
     if (state.status !== 'IDLE' && state.status !== 'QUOTING')
         return;
@@ -459,6 +478,7 @@ export async function startMarketMaker(marketId, upTokenId, downTokenId, marketQ
         upPosition: 0,
         downPosition: 0,
         status: 'IDLE',
+        aggressiveCompleteOrderId: null,
         totalPnL: 0,
         tradesCompleted: 0,
         tradesCut: 0,
@@ -476,12 +496,19 @@ export async function startMarketMaker(marketId, upTokenId, downTokenId, marketQ
                 state.status = 'IDLE';
                 state.upPosition = 0;
                 state.downPosition = 0;
+                state.aggressiveCompleteOrderId = null;
                 await new Promise(r => setTimeout(r, 2000));
             }
             // Handle one-sided states (should be handled by handleOneSidedFill, but check anyway)
             if (state.status === 'ONE_SIDED_UP' || state.status === 'ONE_SIDED_DOWN') {
                 // Already handled, just wait a bit
                 await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
+            // Don't place new quotes while aggressive complete is pending
+            if (state.status === 'AGGRESSIVE_COMPLETE') {
+                // Wait for aggressive complete to resolve (handled in handleOneSidedFill)
+                await new Promise(r => setTimeout(r, 1000));
                 continue;
             }
             // Update quotes
