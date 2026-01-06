@@ -236,6 +236,7 @@ export async function executeTrade(arb) {
     const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     const totalTime = Date.now() - startTime;
     console.log(`\n   📊 FINAL: ${finalPos.up} UP, ${finalPos.down} DOWN (${totalTime}ms)`);
+    // SUCCESS - equal positions
     if (finalPos.up === finalPos.down && finalPos.up > 0) {
         console.log(`   ✅✅ SUCCESS! ${finalPos.up} each`);
         completedMarkets.add(arb.market_id);
@@ -246,8 +247,52 @@ export async function executeTrade(arb) {
         executedTrades.push(trade);
         return trade;
     }
-    // IMBALANCED
-    console.log(`   🚨 Imbalanced! Reversing...`);
+    // NOTHING FILLED - can retry
+    if (finalPos.up === 0 && finalPos.down === 0) {
+        console.log(`   ⚠️ Nothing filled - can retry`);
+        trade.error = 'No fills';
+        trade.can_retry = true;
+        executedTrades.push(trade);
+        return trade;
+    }
+    // IMBALANCED - smart balance (sell excess, keep matched portion)
+    console.log(`   ⚖️ Imbalanced! Smart balancing...`);
+    if (finalPos.down > finalPos.up && finalPos.up > 0) {
+        // More DOWN than UP - sell excess DOWN
+        const excess = finalPos.down - finalPos.up;
+        console.log(`   📤 Selling ${excess} excess DOWN to match ${finalPos.up} UP`);
+        await marketSell(arb.down_token_id, excess, 'DOWN');
+        const afterBalance = await getBothPositions(arb.up_token_id, arb.down_token_id);
+        if (afterBalance.up === afterBalance.down && afterBalance.up > 0) {
+            console.log(`   ✅ Balanced! ${afterBalance.up} each`);
+            completedMarkets.add(arb.market_id);
+            trade.status = 'filled';
+            trade.shares = afterBalance.up;
+            trade.has_exposure = false;
+            trade.can_retry = false;
+            executedTrades.push(trade);
+            return trade;
+        }
+    }
+    else if (finalPos.up > finalPos.down && finalPos.down > 0) {
+        // More UP than DOWN - sell excess UP
+        const excess = finalPos.up - finalPos.down;
+        console.log(`   📤 Selling ${excess} excess UP to match ${finalPos.down} DOWN`);
+        await marketSell(arb.up_token_id, excess, 'UP');
+        const afterBalance = await getBothPositions(arb.up_token_id, arb.down_token_id);
+        if (afterBalance.up === afterBalance.down && afterBalance.up > 0) {
+            console.log(`   ✅ Balanced! ${afterBalance.up} each`);
+            completedMarkets.add(arb.market_id);
+            trade.status = 'filled';
+            trade.shares = afterBalance.up;
+            trade.has_exposure = false;
+            trade.can_retry = false;
+            executedTrades.push(trade);
+            return trade;
+        }
+    }
+    // Smart balance failed - try full reversal
+    console.log(`   🚨 Smart balance failed, reversing all...`);
     if (await reverseToZero(arb.up_token_id, arb.down_token_id)) {
         trade.error = 'Reversed';
         trade.can_retry = true;
