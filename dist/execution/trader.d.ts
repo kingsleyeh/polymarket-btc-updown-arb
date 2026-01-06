@@ -1,14 +1,18 @@
 /**
- * SIMPLE LIMIT ORDER EXECUTION
+ * ORDER BOOK AWARE EXECUTION
  *
- * Place both orders, wait for fills, verify positions
- * No FAK, no race conditions, no stale position checks
+ * 1. Fetch real order book to get exact ask prices
+ * 2. Place orders at actual ask (instant fill)
+ * 3. Fast polling (500ms) with early exit
+ *
+ * No blind buffers - we know exactly what we're paying
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
     id: string;
     market_id: string;
     shares: number;
+    cost: number;
     status: 'filled' | 'failed';
     has_exposure: boolean;
     can_retry: boolean;
@@ -17,11 +21,7 @@ interface ExecutedTrade {
 export declare function canTradeMarket(marketId: string): boolean;
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * MAIN EXECUTION
- *
- * 1. Place BOTH limit orders simultaneously at detected prices
- * 2. Wait for fills
- * 3. Verify final positions match
+ * MAIN EXECUTION - Order Book Aware
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {
