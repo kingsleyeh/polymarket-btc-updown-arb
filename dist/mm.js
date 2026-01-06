@@ -1,55 +1,152 @@
 /**
- * MARKET MAKER ENTRY POINT
+ * MARKET MAKER ENTRY POINT - Dual Strategy
+ *
+ * Continuously monitors two markets:
+ *   - LIVE (≤15 min to expiry): 3% edge target
+ *   - PREMARKET (15-30 min to expiry): 2% edge target
  *
  * Run with: npm run mm
  */
 import * as dotenv from 'dotenv';
-import { initializeMarketMaker, startMarketMaker, stopMarketMaker } from './execution/market-maker';
-import { scanBTCUpDownMarkets } from './crypto/scanner';
+import { initializeMarketMaker, startMarketMakerForMarket, stopMarketMaker, getMarketState, printStats } from './execution/market-maker';
+import { scanMarketsWithStrategy } from './crypto/scanner';
+import { connectOrderBookWebSocket, disconnectOrderBookWebSocket } from './execution/orderbook-ws';
 dotenv.config();
+const activeMarkets = new Map();
+let isRunning = true;
+async function scanAndUpdateMarkets() {
+    try {
+        const markets = await scanMarketsWithStrategy();
+        return markets;
+    }
+    catch (error) {
+        console.log(`   ⚠️ Market scan error: ${error.message}`);
+        return [];
+    }
+}
+function formatTimeToExpiry(ms) {
+    const minutes = Math.floor(ms / 60000);
+    const seconds = Math.floor((ms % 60000) / 1000);
+    return `${minutes}m ${seconds}s`;
+}
 async function main() {
-    console.log('\n==========================================');
-    console.log('   BTC UP/DOWN MARKET MAKER - Phase 1');
-    console.log('==========================================\n');
+    console.log('\n' + '='.repeat(70));
+    console.log('   BTC UP/DOWN MARKET MAKER - Dual Strategy');
+    console.log('='.repeat(70));
+    console.log('\nStrategies:');
+    console.log('   📈 LIVE (≤15 min to expiry): Target 3% edge');
+    console.log('   📊 PREMARKET (15-30 min to expiry): Target 2% edge');
+    console.log('\nFilters:');
+    console.log('   ⚠️ Skip if UP or DOWN >= 80¢ (high volatility)');
+    console.log('='.repeat(70) + '\n');
     // Initialize
     const initialized = await initializeMarketMaker();
     if (!initialized) {
         console.error('Failed to initialize market maker');
         process.exit(1);
     }
-    // Find active market
-    console.log('\nScanning for BTC Up/Down 15-minute markets...');
-    const markets = await scanBTCUpDownMarkets();
-    if (markets.length === 0) {
-        console.log('No active BTC Up/Down markets found');
-        process.exit(1);
-    }
-    // Pick the market with most time remaining
-    const market = markets.reduce((best, m) => {
-        const bestExpiry = best.expiry_timestamp || 0;
-        const mExpiry = m.expiry_timestamp || 0;
-        return mExpiry > bestExpiry ? m : best;
-    }, markets[0]);
-    const timeToExpiry = market.expiry_timestamp
-        ? Math.round((new Date(market.expiry_timestamp).getTime() - Date.now()) / 60000)
-        : 0;
-    console.log(`\nSelected market: ${market.question}`);
-    console.log(`Time to expiry: ${timeToExpiry} minutes`);
-    console.log(`UP token: ${market.up_token_id}`);
-    console.log(`DOWN token: ${market.down_token_id}`);
+    // Connect WebSocket
+    await connectOrderBookWebSocket();
     // Handle shutdown
-    process.on('SIGINT', () => {
+    const shutdown = () => {
         console.log('\n\nShutting down...');
+        isRunning = false;
         stopMarketMaker();
+        disconnectOrderBookWebSocket();
+        printStats();
         process.exit(0);
-    });
-    process.on('SIGTERM', () => {
-        console.log('\n\nShutting down...');
-        stopMarketMaker();
-        process.exit(0);
-    });
-    // Start market making
-    await startMarketMaker(market.id, market.up_token_id, market.down_token_id, market.question);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    console.log('🔍 Starting continuous market scan...\n');
+    // Main loop - continuously scan and trade
+    while (isRunning) {
+        try {
+            const now = Date.now();
+            // Scan for markets
+            const markets = await scanAndUpdateMarkets();
+            if (markets.length === 0) {
+                console.log(`[${new Date().toISOString()}] No markets found (waiting for 15-30 min window)`);
+                await new Promise(r => setTimeout(r, 10000)); // Wait 10s before next scan
+                continue;
+            }
+            // Process each market
+            for (const market of markets) {
+                const timeToExpiry = market.expiry_timestamp - now;
+                const marketKey = market.id;
+                // Skip if market expired or too close
+                if (timeToExpiry <= 60000) { // Less than 1 minute
+                    activeMarkets.delete(marketKey);
+                    continue;
+                }
+                // Check if we're already tracking this market
+                const existing = activeMarkets.get(marketKey);
+                if (existing) {
+                    // Already tracking - check status
+                    if (existing.status === 'HOLDING') {
+                        // Still holding, wait for expiry
+                        if (timeToExpiry <= 0) {
+                            console.log(`   ✅ Market expired - position settled`);
+                            activeMarkets.delete(marketKey);
+                        }
+                        continue;
+                    }
+                    if (existing.status === 'TRADING') {
+                        // Check if trade completed
+                        const state = getMarketState();
+                        if (state && state.status === 'HOLDING') {
+                            existing.status = 'HOLDING';
+                            console.log(`   📦 Now holding position in ${market.question.slice(0, 40)}...`);
+                        }
+                        continue; // Don't start new trade while one is active
+                    }
+                }
+                // Check if we're already trading any market
+                const state = getMarketState();
+                if (state && (state.status === 'QUOTING' || state.status === 'AGGRESSIVE_COMPLETE' || state.status === 'ONE_SIDED_UP' || state.status === 'ONE_SIDED_DOWN')) {
+                    // Already actively trading, don't start another
+                    continue;
+                }
+                // Check if we're holding a position in any market
+                if (state && state.status === 'HOLDING') {
+                    // We're holding - don't trade until expiry
+                    continue;
+                }
+                // New market or not yet trading - start trading
+                console.log(`\n[${new Date().toISOString()}] Found ${market.strategy} market:`);
+                console.log(`   ${market.question}`);
+                console.log(`   Time to expiry: ${formatTimeToExpiry(timeToExpiry)}`);
+                activeMarkets.set(marketKey, {
+                    market,
+                    status: 'TRADING',
+                });
+                // Start trading this market (non-blocking - runs in background)
+                startMarketMakerForMarket(market).then(() => {
+                    const m = activeMarkets.get(marketKey);
+                    if (m) {
+                        const finalState = getMarketState();
+                        if (finalState && finalState.status === 'HOLDING') {
+                            m.status = 'HOLDING';
+                        }
+                        else {
+                            m.status = 'EXPIRED';
+                        }
+                    }
+                }).catch((error) => {
+                    console.error(`Error in market maker: ${error.message}`);
+                    activeMarkets.delete(marketKey);
+                });
+                // Only trade one market at a time
+                break;
+            }
+            // Brief pause between scans
+            await new Promise(r => setTimeout(r, 5000));
+        }
+        catch (error) {
+            console.error(`Main loop error: ${error.message}`);
+            await new Promise(r => setTimeout(r, 5000));
+        }
+    }
 }
 main().catch((error) => {
     console.error('Fatal error:', error);

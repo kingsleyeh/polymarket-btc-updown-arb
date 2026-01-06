@@ -1,12 +1,27 @@
 /**
  * MARKET MAKER STRATEGY
  * 
- * Phase 1: Conservative market making with profit protection
+ * Two strategies based on market timing:
  * 
- * 1. Place bids for both UP and DOWN at prices that sum to TARGET_COMBINED
- * 2. Wait for fills
- * 3. If one side fills, aggressively complete the other side if still profitable
- * 4. If completing would be unprofitable, cut loss immediately
+ * PREMARKET (15-30 min to expiry):
+ *   - Lower volatility, liquidity trickling in
+ *   - Target 2% edge
+ *   - If one leg fills when market goes live (15 min mark), risk management kicks in
+ * 
+ * LIVE (≤15 min to expiry):
+ *   - Active market
+ *   - Target 3% edge
+ *   - Standard risk management
+ * 
+ * Both strategies:
+ *   1. Place bids for both UP and DOWN at prices that sum to TARGET_COMBINED
+ *   2. Wait for fills
+ *   3. If one side fills, aggressively complete the other side if still profitable
+ *   4. If completing would be unprofitable, cut loss immediately
+ *   5. Once both sides filled, HOLD until expiry - NO MORE TRADING
+ * 
+ * Volatility filter:
+ *   - Skip if UP >= 80¢ OR DOWN >= 80¢
  */
 
 import { ClobClient, Side, AssetType, OrderType } from '@polymarket/clob-client';
@@ -18,16 +33,29 @@ import {
   getBestBid,
   disconnectOrderBookWebSocket 
 } from './orderbook-ws';
+import { scanMarketsWithStrategy, CategorizedMarket, MarketStrategy } from '../crypto/scanner';
 
-// Phase 1 Configuration
+// Strategy-specific configuration
+const STRATEGY_CONFIG = {
+  LIVE: {
+    TARGET_COMBINED: 0.97,      // 3% profit target
+    MIN_EDGE_TO_QUOTE: 0.02,    // 2% minimum edge
+  },
+  PREMARKET: {
+    TARGET_COMBINED: 0.98,      // 2% profit target
+    MIN_EDGE_TO_QUOTE: 0.015,   // 1.5% minimum edge
+  },
+};
+
+// Shared configuration
 const CONFIG = {
-  TARGET_COMBINED: 0.97,        // 3% profit target
   MAX_COMBINED: 1.005,          // Accept up to 0.5% loss to complete (better than cutting)
   SHARES_PER_ORDER: 5,          // Small size for learning
   REQUOTE_INTERVAL_MS: 2000,    // Update quotes every 2s
-  MIN_EDGE_TO_QUOTE: 0.02,      // Only quote if potential 2%+ edge exists
   POSITION_CHECK_INTERVAL_MS: 500,
   CUT_LOSS_MAX_ATTEMPTS: 3,     // Try selling 3 times before giving up
+  VOLATILITY_THRESHOLD: 0.80,   // Skip if UP or DOWN >= 80¢
+  MARKET_SCAN_INTERVAL_MS: 10000, // Scan for new markets every 10s
 };
 
 const CHAIN_ID = 137;
@@ -36,9 +64,10 @@ const CLOB_HOST = 'https://clob.polymarket.com';
 let clobClient: ClobClient | null = null;
 let wallet: ethers.Wallet | null = null;
 
-// Track state
+// Track state per market
 interface MarketMakerState {
   marketId: string;
+  marketQuestion: string;
   upTokenId: string;
   downTokenId: string;
   upOrderId: string | null;
@@ -48,7 +77,9 @@ interface MarketMakerState {
   upPosition: number;
   downPosition: number;
   status: 'IDLE' | 'QUOTING' | 'ONE_SIDED_UP' | 'ONE_SIDED_DOWN' | 'COMPLETE' | 'BLOCKED' | 'AGGRESSIVE_COMPLETE' | 'HOLDING';
-  aggressiveCompleteOrderId: string | null; // Track order placed to complete pair
+  aggressiveCompleteOrderId: string | null;
+  strategy: MarketStrategy;
+  expiryTimestamp: number;
   totalPnL: number;
   tradesCompleted: number;
   tradesCut: number;
@@ -192,7 +223,12 @@ async function marketSell(tokenId: string, shares: number): Promise<boolean> {
   }
 }
 
-function calculateBidPrices(upAsk: number, downAsk: number): { upBid: number; downBid: number } | null {
+function calculateBidPrices(
+  upAsk: number, 
+  downAsk: number, 
+  targetCombined: number = 0.97,
+  minEdge: number = 0.02
+): { upBid: number; downBid: number } | null {
   // Current combined ask
   const combinedAsk = upAsk + downAsk;
   
@@ -205,9 +241,9 @@ function calculateBidPrices(upAsk: number, downAsk: number): { upBid: number; do
   const combinedMid = upMid + downMid;
   
   // How much discount do we need from mid to hit target?
-  const discountNeeded = combinedMid - CONFIG.TARGET_COMBINED;
+  const discountNeeded = combinedMid - targetCombined;
   
-  if (discountNeeded < CONFIG.MIN_EDGE_TO_QUOTE) {
+  if (discountNeeded < minEdge) {
     // Not enough potential edge
     return null;
   }
@@ -220,7 +256,7 @@ function calculateBidPrices(upAsk: number, downAsk: number): { upBid: number; do
   const downBid = Math.max(0.01, downMid - (discountNeeded * downWeight));
   
   // Sanity check
-  if (upBid + downBid > CONFIG.TARGET_COMBINED + 0.01) {
+  if (upBid + downBid > targetCombined + 0.01) {
     return null;
   }
   
@@ -442,8 +478,23 @@ async function updateQuotes(): Promise<void> {
     return; // No price data yet
   }
   
-  // Calculate bid prices
-  const prices = calculateBidPrices(upAsk.price, downAsk.price);
+  // VOLATILITY FILTER: Skip if UP or DOWN >= 80¢
+  if (upAsk.price >= CONFIG.VOLATILITY_THRESHOLD || downAsk.price >= CONFIG.VOLATILITY_THRESHOLD) {
+    if (state.status === 'QUOTING') {
+      console.log(`   ⏸️  High volatility: UP=$${upAsk.price.toFixed(2)}, DOWN=$${downAsk.price.toFixed(2)} - pausing`);
+      await cancelAllOrders();
+      state.status = 'IDLE';
+      state.upOrderId = null;
+      state.downOrderId = null;
+    }
+    return; // Skip - too volatile
+  }
+  
+  // Get strategy-specific config
+  const strategyConfig = STRATEGY_CONFIG[state.strategy];
+  
+  // Calculate bid prices using strategy-specific target
+  const prices = calculateBidPrices(upAsk.price, downAsk.price, strategyConfig.TARGET_COMBINED, strategyConfig.MIN_EDGE_TO_QUOTE);
   
   if (!prices) {
     // Not enough edge - cancel existing orders
@@ -510,7 +561,7 @@ async function updateQuotes(): Promise<void> {
   }
   
   console.log(`\n   📊 Market: UP ask=$${upAsk.price.toFixed(3)}, DOWN ask=$${downAsk.price.toFixed(3)} (combined $${(upAsk.price + downAsk.price).toFixed(4)})`);
-  console.log(`   📝 Quoting: UP bid=$${prices.upBid.toFixed(3)}, DOWN bid=$${prices.downBid.toFixed(3)} (target $${CONFIG.TARGET_COMBINED})`);
+  console.log(`   📝 Quoting: UP bid=$${prices.upBid.toFixed(3)}, DOWN bid=$${prices.downBid.toFixed(3)} (target $${strategyConfig.TARGET_COMBINED})`);
   
   const [upOrderId, downOrderId] = await Promise.all([
     placeLimitBuy(state.upTokenId, CONFIG.SHARES_PER_ORDER, prices.upBid),
@@ -593,32 +644,36 @@ async function checkFills(): Promise<void> {
 }
 
 export async function startMarketMaker(
-  marketId: string,
-  upTokenId: string,
-  downTokenId: string,
-  marketQuestion: string
+  market: CategorizedMarket
 ): Promise<void> {
   if (!clobClient) {
     console.error('Market maker not initialized');
     return;
   }
   
+  const strategyConfig = STRATEGY_CONFIG[market.strategy];
+  const timeToExpiry = Math.round(market.timeToExpirySec / 60);
+  
   console.log(`\n${'='.repeat(60)}`);
-  console.log(`   MARKET MAKER - Phase 1`);
+  console.log(`   MARKET MAKER - ${market.strategy} Strategy`);
   console.log(`${'='.repeat(60)}`);
-  console.log(`Market: ${marketQuestion}`);
-  console.log(`Target combined: $${CONFIG.TARGET_COMBINED} (${((1 - CONFIG.TARGET_COMBINED) * 100).toFixed(0)}% profit)`);
+  console.log(`Market: ${market.question}`);
+  console.log(`Strategy: ${market.strategy} (${market.strategy === 'LIVE' ? '≤15 min' : '15-30 min'} to expiry)`);
+  console.log(`Time to expiry: ${timeToExpiry} minutes`);
+  console.log(`Target combined: $${strategyConfig.TARGET_COMBINED} (${((1 - strategyConfig.TARGET_COMBINED) * 100).toFixed(0)}% profit)`);
   console.log(`Shares per order: ${CONFIG.SHARES_PER_ORDER}`);
+  console.log(`Volatility filter: Skip if UP or DOWN >= ${(CONFIG.VOLATILITY_THRESHOLD * 100).toFixed(0)}¢`);
   console.log(`${'='.repeat(60)}\n`);
   
   // Subscribe to order book updates
-  subscribeToTokens([upTokenId, downTokenId]);
+  subscribeToTokens([market.up_token_id, market.down_token_id]);
   
   // Initialize state
   state = {
-    marketId,
-    upTokenId,
-    downTokenId,
+    marketId: market.id,
+    marketQuestion: market.question,
+    upTokenId: market.up_token_id,
+    downTokenId: market.down_token_id,
     upOrderId: null,
     downOrderId: null,
     upBidPrice: 0,
@@ -627,6 +682,8 @@ export async function startMarketMaker(
     downPosition: 0,
     status: 'IDLE',
     aggressiveCompleteOrderId: null,
+    strategy: market.strategy,
+    expiryTimestamp: market.expiry_timestamp,
     totalPnL: 0,
     tradesCompleted: 0,
     tradesCut: 0,
@@ -728,12 +785,23 @@ export function printStats(): void {
   console.log(`  Net P&L: $${(stats.totalProfit - stats.totalLoss).toFixed(2)}`);
 }
 
+export function getMarketState(): MarketMakerState | null {
+  return state;
+}
+
+export function isHolding(): boolean {
+  return state?.status === 'HOLDING';
+}
+
 export function stopMarketMaker(): void {
   if (state) {
     state.status = 'BLOCKED';
   }
   cancelAllOrders();
-  disconnectOrderBookWebSocket();
-  printStats();
+}
+
+// Alias for the new multi-market approach
+export async function startMarketMakerForMarket(market: CategorizedMarket): Promise<void> {
+  return startMarketMaker(market);
 }
 

@@ -1,13 +1,28 @@
 /**
  * BTC Up/Down 15-Minute Market Scanner
  * 
- * Finds ONLY the CURRENT BTC 15-minute Up/Down market on Polymarket
+ * Scans for BTC 15-minute Up/Down markets on Polymarket
+ * Returns up to 2 markets:
+ *   - CURRENT (live): ≤15 min to expiry
+ *   - NEXT (pre-market): 15-30 min to expiry
+ * 
  * Series 10192 = Bitcoin 15-minute markets
  */
 
 import axios from 'axios';
 import { GAMMA_API_URL, EXPIRY_CUTOFF_SECONDS } from '../config/constants';
 import { UpDownMarket } from '../types/arbitrage';
+
+// Market timing constants (in seconds)
+const LIVE_MARKET_THRESHOLD = 15 * 60;     // ≤15 min = live market
+const PREMARKET_MAX_THRESHOLD = 30 * 60;   // 15-30 min = pre-market
+
+export type MarketStrategy = 'LIVE' | 'PREMARKET';
+
+export interface CategorizedMarket extends UpDownMarket {
+  strategy: MarketStrategy;
+  timeToExpirySec: number;
+}
 
 /**
  * Check if a market title indicates a 15-minute window (has time range like "12:45PM-1:00PM")
@@ -109,11 +124,143 @@ export async function scanBTCUpDownMarkets(): Promise<UpDownMarket[]> {
     console.error('Market scan error:', error.message);
   }
   
-  // Sort by expiry (soonest first) and return only the CURRENT one
+  // Sort by expiry (soonest first)
   markets.sort((a, b) => a.expiry_timestamp - b.expiry_timestamp);
   
   // Return only the next upcoming market (the one we can trade)
   return markets.slice(0, 1);
+}
+
+/**
+ * Scan for markets with strategy categorization
+ * Returns up to 2 markets: LIVE (≤15min) and PREMARKET (15-30min)
+ */
+export async function scanMarketsWithStrategy(): Promise<CategorizedMarket[]> {
+  const markets: UpDownMarket[] = [];
+  const now = Date.now();
+  
+  try {
+    // Series 10192 = BTC 15-minute Up/Down markets
+    const response = await axios.get(`${GAMMA_API_URL}/events`, {
+      params: {
+        series_id: 10192,
+        active: true,
+        closed: false,
+        limit: 20,
+      },
+      timeout: 5000,
+    });
+    
+    for (const event of response.data || []) {
+      const market = event.markets?.[0];
+      if (!market) continue;
+      
+      const question = market.question || event.title || '';
+      
+      // MUST be a 15-minute market
+      if (!is15MinuteMarket(question)) continue;
+      
+      // MUST be Bitcoin
+      const qLower = question.toLowerCase();
+      if (!qLower.includes('bitcoin') && !qLower.includes('btc')) continue;
+      
+      // Parse outcomes
+      let outcomes: string[];
+      try {
+        outcomes = typeof market.outcomes === 'string'
+          ? JSON.parse(market.outcomes)
+          : market.outcomes || [];
+      } catch {
+        continue;
+      }
+      
+      if (outcomes.length !== 2) continue;
+      
+      const hasUp = outcomes.some(o => o.toLowerCase() === 'up');
+      const hasDown = outcomes.some(o => o.toLowerCase() === 'down');
+      if (!hasUp || !hasDown) continue;
+      
+      // Get expiry
+      const endDate = market.endDate || event.endDate;
+      if (!endDate) continue;
+      
+      const expiryTimestamp = new Date(endDate).getTime();
+      const timeToExpiry = (expiryTimestamp - now) / 1000;
+      
+      // Skip if already expired or too close to expiry
+      if (timeToExpiry <= EXPIRY_CUTOFF_SECONDS) continue;
+      
+      // Skip if too far out (>30 min)
+      if (timeToExpiry > PREMARKET_MAX_THRESHOLD) continue;
+      
+      // Parse tokens
+      let tokenIds: string[];
+      try {
+        tokenIds = typeof market.clobTokenIds === 'string'
+          ? JSON.parse(market.clobTokenIds)
+          : market.clobTokenIds || [];
+      } catch {
+        continue;
+      }
+      
+      if (tokenIds.length < 2) continue;
+      
+      const upIndex = outcomes.findIndex(o => o.toLowerCase() === 'up');
+      const downIndex = outcomes.findIndex(o => o.toLowerCase() === 'down');
+      
+      if (upIndex === -1 || downIndex === -1) continue;
+      
+      markets.push({
+        id: market.id || market.conditionId,
+        conditionId: market.conditionId,
+        question: question,
+        up_token_id: tokenIds[upIndex],
+        down_token_id: tokenIds[downIndex],
+        expiry_timestamp: expiryTimestamp,
+        volume: parseFloat(market.volume || '0'),
+        created_at: market.createdAt || '',
+      });
+    }
+    
+  } catch (error: any) {
+    console.error('Market scan error:', error.message);
+  }
+  
+  // Sort by expiry (soonest first)
+  markets.sort((a, b) => a.expiry_timestamp - b.expiry_timestamp);
+  
+  // Categorize markets
+  const categorized: CategorizedMarket[] = [];
+  
+  for (const market of markets) {
+    const timeToExpirySec = (market.expiry_timestamp - now) / 1000;
+    
+    if (timeToExpirySec <= LIVE_MARKET_THRESHOLD) {
+      // LIVE: ≤15 min to expiry
+      categorized.push({
+        ...market,
+        strategy: 'LIVE',
+        timeToExpirySec,
+      });
+    } else if (timeToExpirySec <= PREMARKET_MAX_THRESHOLD) {
+      // PREMARKET: 15-30 min to expiry
+      categorized.push({
+        ...market,
+        strategy: 'PREMARKET',
+        timeToExpirySec,
+      });
+    }
+  }
+  
+  // Return at most 2 markets (1 live, 1 premarket)
+  const liveMarket = categorized.find(m => m.strategy === 'LIVE');
+  const premarketMarket = categorized.find(m => m.strategy === 'PREMARKET');
+  
+  const result: CategorizedMarket[] = [];
+  if (liveMarket) result.push(liveMarket);
+  if (premarketMarket) result.push(premarketMarket);
+  
+  return result;
 }
 
 /**
