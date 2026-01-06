@@ -3,12 +3,13 @@
  *
  * Detects opportunities where:
  * buy_up_price + buy_down_price < 1.00 - MIN_EDGE
+ *
+ * Uses WebSocket cache for instant price access
  */
 import { UpDownMarket, MarketPrices, ArbitrageOpportunity } from '../types/arbitrage';
 /**
  * Fetch current prices for a market
- * Uses /price endpoint which calculates actual executable prices
- * accounting for Polymarket's complement system (buy YES = sell NO)
+ * PRIORITY: WebSocket cache (instant) → REST fallback
  */
 export declare function fetchMarketPrices(market: UpDownMarket): Promise<MarketPrices | null>;
 /**

@@ -313,64 +313,20 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     }
   }
 
-  // STEP 1: GET ORDER BOOK PRICES (WebSocket cache or REST fallback)
-  let upBook: {price: number, available: number} | null = null;
-  let downBook: {price: number, available: number} | null = null;
-  
-  // Try WebSocket cache first (INSTANT)
-  if (hasFreshCache(arb.up_token_id, arb.down_token_id)) {
-    console.log(`\n   📡 Using WebSocket cache (instant)`);
-    upBook = getPriceForShares(arb.up_token_id, MIN_SHARES, 'UP');
-    downBook = getPriceForShares(arb.down_token_id, MIN_SHARES, 'DOWN');
-  }
-  
-  // Fallback to REST if cache miss
-  if (!upBook || !downBook) {
-    console.log(`\n   📖 Fetching order books (REST fallback)...`);
-    [upBook, downBook] = await Promise.all([
-      getOrderBookAskREST(arb.up_token_id, MIN_SHARES, 'UP'),
-      getOrderBookAskREST(arb.down_token_id, MIN_SHARES, 'DOWN')
-    ]);
-  }
-  
-  if (!upBook || !downBook) {
-    console.log(`   ❌ Could not get order book`);
-    trade.error = 'No order book';
-    trade.can_retry = true;
-    executedTrades.push(trade);
-    return trade;
-  }
-  
-  // Check liquidity
-  if (upBook.available < MIN_SHARES || downBook.available < MIN_SHARES) {
-    console.log(`   ⚠️ Insufficient liquidity: UP=${upBook.available}, DOWN=${downBook.available}`);
-    trade.error = 'Low liquidity';
-    trade.can_retry = true;
-    executedTrades.push(trade);
-    return trade;
-  }
-  
-  // VALIDATE ARB IS STILL REAL
-  const realCost = upBook.price + downBook.price;
+  // USE ARB PRICES DIRECTLY - Scanner already validated from same WebSocket cache
+  // No re-checking = no latency = no "arb disappeared"
+  const upPrice = arb.up_price;
+  const downPrice = arb.down_price;
+  const realCost = upPrice + downPrice;
   const realEdge = (1 - realCost) * 100;
   
-  console.log(`   📊 Real: UP=$${upBook.price.toFixed(3)} + DOWN=$${downBook.price.toFixed(3)} = $${realCost.toFixed(4)} (${realEdge.toFixed(1)}%)`);
-  
-  if (realCost >= 0.99) {
-    console.log(`   ❌ Arb gone (${realEdge.toFixed(2)}%)`);
-    trade.error = 'Arb disappeared';
-    trade.can_retry = true;
-    executedTrades.push(trade);
-    return trade;
-  }
-
-  // STEP 2: PLACE ORDERS AT EXACT ASK PRICES
-  const totalCost = (upBook.price + downBook.price) * MIN_SHARES;
-  console.log(`\n   ⚡ PLACING: ${MIN_SHARES} each @ $${totalCost.toFixed(2)} total`);
+  const totalCost = realCost * MIN_SHARES;
+  console.log(`\n   ⚡ EXECUTING: UP=$${upPrice.toFixed(3)} + DOWN=$${downPrice.toFixed(3)} = $${realCost.toFixed(4)} (${realEdge.toFixed(1)}%)`);
+  console.log(`   💰 Total: $${totalCost.toFixed(2)} for ${MIN_SHARES} shares each`);
 
   const [upOrderId, downOrderId] = await Promise.all([
-    placeLimitBuy(arb.up_token_id, MIN_SHARES, upBook.price, 'UP'),
-    placeLimitBuy(arb.down_token_id, MIN_SHARES, downBook.price, 'DOWN')
+    placeLimitBuy(arb.up_token_id, MIN_SHARES, upPrice, 'UP'),
+    placeLimitBuy(arb.down_token_id, MIN_SHARES, downPrice, 'DOWN')
   ]);
 
   if (!upOrderId || !downOrderId) {
@@ -397,7 +353,7 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
 
   // SUCCESS
   if (finalPos.up === finalPos.down && finalPos.up >= MIN_SHARES) {
-    const actualCost = (upBook.price + downBook.price) * finalPos.up;
+    const actualCost = realCost * finalPos.up;
     console.log(`   ✅✅ SUCCESS! ${finalPos.up} each @ $${actualCost.toFixed(2)} (${realEdge.toFixed(1)}% edge)`);
     completedMarkets.add(arb.market_id);
     trade.status = 'filled';
@@ -431,7 +387,7 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     
     const balancedPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     if (balancedPos.up === balancedPos.down && balancedPos.up > 0) {
-      const actualCost = (upBook.price + downBook.price) * balancedPos.up;
+      const actualCost = realCost * balancedPos.up;
       console.log(`   ✅ Balanced! ${balancedPos.up} each @ $${actualCost.toFixed(2)}`);
       completedMarkets.add(arb.market_id);
       trade.status = 'filled';

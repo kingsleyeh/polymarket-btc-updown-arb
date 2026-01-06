@@ -3,51 +3,56 @@
  *
  * Detects opportunities where:
  * buy_up_price + buy_down_price < 1.00 - MIN_EDGE
+ *
+ * Uses WebSocket cache for instant price access
  */
 import axios from 'axios';
 import { CLOB_API_URL, MIN_EDGE, EXPIRY_CUTOFF_SECONDS, PAPER_MAX_SHARES } from '../config/constants';
+import { getBestAsk, hasFreshCache } from '../execution/orderbook-ws';
 // Track active arbitrage opportunities
 const activeArbs = new Map();
 /**
  * Fetch current prices for a market
- * Uses /price endpoint which calculates actual executable prices
- * accounting for Polymarket's complement system (buy YES = sell NO)
+ * PRIORITY: WebSocket cache (instant) → REST fallback
  */
 export async function fetchMarketPrices(market) {
+    // TRY WEBSOCKET CACHE FIRST (instant, no latency)
+    if (hasFreshCache(market.up_token_id, market.down_token_id)) {
+        const upAsk = getBestAsk(market.up_token_id);
+        const downAsk = getBestAsk(market.down_token_id);
+        if (upAsk && downAsk) {
+            return {
+                market_id: market.id,
+                up_price: upAsk.price,
+                down_price: downAsk.price,
+                up_shares_available: upAsk.size,
+                down_shares_available: downAsk.size,
+                timestamp: Date.now(),
+            };
+        }
+    }
+    // FALLBACK TO REST (slower but reliable)
     try {
-        // Fetch execution prices for both Up and Down tokens
-        // The /price endpoint accounts for complement trading
-        const [upPriceResp, downPriceResp, upBook, downBook] = await Promise.all([
-            axios.get(`${CLOB_API_URL}/price`, {
-                params: { token_id: market.up_token_id, side: 'buy' },
-                timeout: 2000, // 2s timeout
-            }),
-            axios.get(`${CLOB_API_URL}/price`, {
-                params: { token_id: market.down_token_id, side: 'buy' },
-                timeout: 2000, // 2s timeout
-            }),
-            // Also get orderbook for liquidity info
+        const [upBook, downBook] = await Promise.all([
             axios.get(`${CLOB_API_URL}/book`, {
                 params: { token_id: market.up_token_id },
-                timeout: 2000, // 2s timeout
+                timeout: 2000,
             }),
             axios.get(`${CLOB_API_URL}/book`, {
                 params: { token_id: market.down_token_id },
-                timeout: 2000, // 2s timeout
+                timeout: 2000,
             }),
         ]);
-        // Extract execution prices
-        const upPrice = upPriceResp.data?.price ? parseFloat(upPriceResp.data.price) : null;
-        const downPrice = downPriceResp.data?.price ? parseFloat(downPriceResp.data.price) : null;
-        // Get available liquidity from orderbooks
-        const upAsks = upBook.data?.asks || [];
-        const downAsks = downBook.data?.asks || [];
-        const upShares = upAsks.length > 0 ? parseFloat(upAsks[0].size) : 0;
-        const downShares = downAsks.length > 0 ? parseFloat(downAsks[0].size) : 0;
-        // Both prices must exist
-        if (upPrice === null || downPrice === null) {
+        // Get best asks (sorted ascending - lowest first)
+        const upAsks = (upBook.data?.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        const downAsks = (downBook.data?.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        if (upAsks.length === 0 || downAsks.length === 0) {
             return null;
         }
+        const upPrice = parseFloat(upAsks[0].price);
+        const downPrice = parseFloat(downAsks[0].price);
+        const upShares = parseFloat(upAsks[0].size);
+        const downShares = parseFloat(downAsks[0].size);
         return {
             market_id: market.id,
             up_price: upPrice,
