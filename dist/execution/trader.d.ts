@@ -1,11 +1,8 @@
 /**
- * ORDER BOOK TAKER Execution
+ * ULTRA-LOW LATENCY Execution
  *
- * When arb spotted:
- * 1. Fetch order books for UP and DOWN
- * 2. See what ASK prices are available (what sellers are offering)
- * 3. TAKE that liquidity immediately (market buy at ask)
- * 4. Auto-reverse any imbalance
+ * Scanner already fetched order book - USE THOSE PRICES
+ * Place orders IMMEDIATELY - no redundant API calls
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -20,7 +17,7 @@ interface ExecutedTrade {
 export declare function canTradeMarket(marketId: string): boolean;
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * Execute trade - ORDER BOOK TAKER
+ * FAST EXECUTE - Use scanner prices directly, no redundant fetches
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {
