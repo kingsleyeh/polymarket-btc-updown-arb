@@ -91,16 +91,18 @@ async function getBothPositions(upTokenId, downTokenId) {
     return { up, down };
 }
 /**
- * Market buy - use high price to ensure fill
+ * Buy at specific price (+ small buffer to ensure fill)
  */
-async function marketBuy(tokenId, shares, label) {
+async function buyAt(tokenId, shares, price, label) {
     if (!clobClient)
         return null;
+    // Add 1 cent buffer to help fill
+    const limitPrice = Math.min(price + 0.01, 0.99);
     try {
-        console.log(`   📥 Market buying ${shares} ${label}...`);
+        console.log(`   📥 Buying ${shares} ${label} @ $${limitPrice.toFixed(2)}...`);
         const result = await clobClient.createAndPostOrder({
             tokenID: tokenId,
-            price: 0.99, // High price = market order
+            price: limitPrice,
             size: shares,
             side: Side.BUY,
         }).catch(e => ({ error: e }));
@@ -253,11 +255,12 @@ export async function executeTrade(arb) {
         const newStart = await getBothPositions(arb.up_token_id, arb.down_token_id);
         console.log(`   📊 After reversal: ${newStart.up} UP, ${newStart.down} DOWN`);
     }
-    // ===== MARKET BUY BOTH SIDES =====
-    console.log(`\n   🚀 EXECUTING: Buy ${MIN_SHARES} of each side`);
-    // Place both orders
-    const downOrderId = await marketBuy(arb.down_token_id, MIN_SHARES, 'DOWN');
-    const upOrderId = await marketBuy(arb.up_token_id, MIN_SHARES, 'UP');
+    // ===== BUY BOTH SIDES AT ARB PRICES =====
+    const totalCost = (arb.up_price + arb.down_price + 0.02) * MIN_SHARES; // +2 cents buffer
+    console.log(`\n   🚀 EXECUTING: Buy ${MIN_SHARES} of each @ $${(arb.up_price + arb.down_price).toFixed(2)} = $${totalCost.toFixed(2)} total`);
+    // Place both orders at the arb prices
+    const downOrderId = await buyAt(arb.down_token_id, MIN_SHARES, arb.down_price, 'DOWN');
+    const upOrderId = await buyAt(arb.up_token_id, MIN_SHARES, arb.up_price, 'UP');
     if (!downOrderId && !upOrderId) {
         console.log(`   ❌ Both orders failed`);
         trade.error = 'Both orders failed';
