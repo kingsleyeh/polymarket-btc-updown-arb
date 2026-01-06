@@ -39,7 +39,7 @@ const CONFIG = {
   REQUOTE_INTERVAL_MS: 2000,
   POSITION_CHECK_INTERVAL_MS: 500,
   CUT_LOSS_MAX_ATTEMPTS: 3,
-  VOLATILITY_THRESHOLD: 0.80,   // Skip if UP or DOWN >= 80¢
+  STOP_QUOTING_BEFORE_EXPIRY_MS: 5 * 60 * 1000,  // Stop new quotes <5 min to expiry
 };
 
 const CHAIN_ID = 137;
@@ -376,10 +376,11 @@ async function processMarket(state: MarketState): Promise<void> {
     }
   }
   
-  // Volatility filter
-  if (upAsk.price >= CONFIG.VOLATILITY_THRESHOLD || downAsk.price >= CONFIG.VOLATILITY_THRESHOLD) {
+  // Stop taking new quotes <5 min before expiry
+  if (timeToExpiry <= CONFIG.STOP_QUOTING_BEFORE_EXPIRY_MS) {
     if (state.status === 'QUOTING') {
-      console.log(`   [${state.strategy}] ⏸️ Volatility: UP=$${upAsk.price.toFixed(2)}, DOWN=$${downAsk.price.toFixed(2)}`);
+      console.log(`   [${state.strategy}] ⏸️ <5 min to expiry - no new quotes`);
+      await cancelAllOrders();
       state.status = 'IDLE';
     }
     return;

@@ -45,8 +45,9 @@ async function main() {
     console.log('\nWatches BOTH markets simultaneously:');
     console.log('   📈 LIVE (≤15 min to expiry): Target 3% edge');
     console.log('   📊 PREMARKET (15-30 min to expiry): Target 2% edge');
-    console.log('\nFilters:');
-    console.log('   ⚠️ Skip if UP or DOWN >= 80¢ (high volatility)');
+    console.log('\nRules:');
+    console.log('   ⏰ Stop new quotes <5 min before expiry');
+    console.log('   ⚠️ One-sided fills handled with risk management');
     console.log('\nBehavior:');
     console.log('   ✅ Trade both markets in parallel');
     console.log('   ✅ Hold positions until expiry');
