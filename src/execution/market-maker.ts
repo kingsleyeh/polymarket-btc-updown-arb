@@ -34,13 +34,15 @@ const STRATEGY_CONFIG = {
 
 // Shared configuration
 const CONFIG = {
-  MAX_COMBINED: 1.005,          // Accept up to 0.5% loss to complete
+  MAX_COMBINED: 1.02,           // Accept up to 2% loss to complete (was 0.5%)
   SHARES_PER_ORDER: 5,
   REQUOTE_INTERVAL_MS: 2000,
   POSITION_CHECK_INTERVAL_MS: 500,
   CUT_LOSS_MAX_ATTEMPTS: 3,
   STOP_QUOTING_BEFORE_EXPIRY_MS: 5 * 60 * 1000,  // Stop new quotes <5 min to expiry
   VOLATILITY_THRESHOLD: 0.80,   // Skip if UP or DOWN >= 80¢
+  AGGRESSIVE_COMPLETE_WAIT_MS: 30000,  // Wait 30s for aggressive complete (was 5s)
+  PRICE_IMPROVEMENT_WAIT_MS: 30000,    // Wait 30s for prices to improve before cutting
 };
 
 const CHAIN_ID = 137;
@@ -239,12 +241,18 @@ async function handleOneSidedFill(state: MarketState, filledSide: 'UP' | 'DOWN',
   }
   
   const wouldPayCombined = filledPrice + otherAsk.price;
+  const wouldLosePct = (wouldPayCombined - 1) * 100;
   console.log(`   [${state.strategy}] 📊 ${otherSide} ask: $${otherAsk.price.toFixed(3)}`);
-  console.log(`   [${state.strategy}] 📊 Would pay combined: $${wouldPayCombined.toFixed(4)}`);
+  console.log(`   [${state.strategy}] 📊 Would pay combined: $${wouldPayCombined.toFixed(4)} (${wouldLosePct >= 0 ? '+' : ''}${wouldLosePct.toFixed(2)}%)`);
   
+  // Always try to complete first, even if it would lose a bit
   if (wouldPayCombined <= CONFIG.MAX_COMBINED) {
     const profitPct = (1 - wouldPayCombined) * 100;
-    console.log(`   [${state.strategy}] ✅ Completing pair (${profitPct.toFixed(2)}%)`);
+    if (profitPct > 0) {
+      console.log(`   [${state.strategy}] ✅ Completing pair (${profitPct.toFixed(2)}% profit)`);
+    } else {
+      console.log(`   [${state.strategy}] ⚠️ Completing pair (${Math.abs(profitPct).toFixed(2)}% loss - acceptable)`);
+    }
     
     await cancelAllOrders();
     state.status = 'AGGRESSIVE_COMPLETE';
@@ -252,8 +260,11 @@ async function handleOneSidedFill(state: MarketState, filledSide: 'UP' | 'DOWN',
     const completeOrderId = await placeLimitBuy(otherTokenId, filledShares, otherAsk.price + 0.01);
     
     if (completeOrderId) {
-      // Wait for fill
-      for (let i = 0; i < 5; i++) {
+      console.log(`   [${state.strategy}] ⏳ Waiting up to ${CONFIG.AGGRESSIVE_COMPLETE_WAIT_MS / 1000}s for fill...`);
+      
+      // Wait longer for fill (30 seconds total)
+      const waitIterations = CONFIG.AGGRESSIVE_COMPLETE_WAIT_MS / 1000;
+      for (let i = 0; i < waitIterations; i++) {
         await new Promise(r => setTimeout(r, 1000));
         
         const upPos = await getPosition(state.upTokenId);
@@ -263,11 +274,16 @@ async function handleOneSidedFill(state: MarketState, filledSide: 'UP' | 'DOWN',
           const minShares = Math.min(upPos, downPos);
           const actualProfit = (1 - wouldPayCombined) * minShares;
           console.log(`   [${state.strategy}] ✅✅ COMPLETE! ${minShares} shares each`);
-          console.log(`   [${state.strategy}] 💰 Profit: $${actualProfit.toFixed(2)}`);
+          if (actualProfit > 0) {
+            console.log(`   [${state.strategy}] 💰 Profit: $${actualProfit.toFixed(2)}`);
+          } else {
+            console.log(`   [${state.strategy}] 💰 Small loss: $${Math.abs(actualProfit).toFixed(2)}`);
+          }
           
           await cancelAllOrders();
           stats.aggressiveCompletes++;
           stats.totalProfit += Math.max(0, actualProfit);
+          stats.totalLoss += Math.max(0, -actualProfit);
           state.status = 'HOLDING';
           state.upPosition = upPos;
           state.downPosition = downPos;
@@ -277,13 +293,76 @@ async function handleOneSidedFill(state: MarketState, filledSide: 'UP' | 'DOWN',
       
       // Didn't fill - cut loss
       await cancelAllOrders();
-      console.log(`   [${state.strategy}] ❌ Aggressive complete didn't fill`);
+      console.log(`   [${state.strategy}] ❌ Aggressive complete didn't fill after ${CONFIG.AGGRESSIVE_COMPLETE_WAIT_MS / 1000}s`);
     }
     
     await cutLoss(state, filledSide, filledShares);
   } else {
-    const wouldLose = (wouldPayCombined - 1) * 100;
-    console.log(`   [${state.strategy}] ❌ Would lose ${wouldLose.toFixed(2)}% - cutting loss`);
+    // Would lose >2% - wait for prices to improve before cutting
+    console.log(`   [${state.strategy}] ⚠️ Would lose ${wouldLosePct.toFixed(2)}% - waiting ${CONFIG.PRICE_IMPROVEMENT_WAIT_MS / 1000}s for prices to improve...`);
+    
+    const startTime = Date.now();
+    let bestCombined = wouldPayCombined;
+    let bestOtherAsk = otherAsk.price;
+    
+    // Wait and monitor for price improvement
+    while (Date.now() - startTime < CONFIG.PRICE_IMPROVEMENT_WAIT_MS) {
+      await new Promise(r => setTimeout(r, 2000)); // Check every 2s
+      
+      const currentOtherAsk = getBestAsk(otherTokenId);
+      if (currentOtherAsk && currentOtherAsk.price < bestOtherAsk) {
+        const newCombined = filledPrice + currentOtherAsk.price;
+        if (newCombined < bestCombined) {
+          bestCombined = newCombined;
+          bestOtherAsk = currentOtherAsk.price;
+          console.log(`   [${state.strategy}] 📉 Price improved: ${otherSide} now $${currentOtherAsk.price.toFixed(3)} (combined $${newCombined.toFixed(4)})`);
+          
+          // If now acceptable, try to complete
+          if (newCombined <= CONFIG.MAX_COMBINED) {
+            console.log(`   [${state.strategy}] ✅ Price improved enough - attempting complete`);
+            await cancelAllOrders();
+            state.status = 'AGGRESSIVE_COMPLETE';
+            
+            const completeOrderId = await placeLimitBuy(otherTokenId, filledShares, currentOtherAsk.price + 0.01);
+            if (completeOrderId) {
+              // Wait for fill
+              for (let i = 0; i < CONFIG.AGGRESSIVE_COMPLETE_WAIT_MS / 1000; i++) {
+                await new Promise(r => setTimeout(r, 1000));
+                
+                const upPos = await getPosition(state.upTokenId);
+                const downPos = await getPosition(state.downTokenId);
+                
+                if (upPos > 0 && downPos > 0 && Math.abs(upPos - downPos) <= 1) {
+                  const minShares = Math.min(upPos, downPos);
+                  const actualProfit = (1 - newCombined) * minShares;
+                  console.log(`   [${state.strategy}] ✅✅ COMPLETE! ${minShares} shares each`);
+                  console.log(`   [${state.strategy}] 💰 ${actualProfit > 0 ? 'Profit' : 'Loss'}: $${Math.abs(actualProfit).toFixed(2)}`);
+                  
+                  await cancelAllOrders();
+                  stats.aggressiveCompletes++;
+                  stats.totalProfit += Math.max(0, actualProfit);
+                  stats.totalLoss += Math.max(0, -actualProfit);
+                  state.status = 'HOLDING';
+                  state.upPosition = upPos;
+                  state.downPosition = downPos;
+                  return;
+                }
+              }
+            }
+            
+            // Didn't fill - continue to cut loss
+            await cancelAllOrders();
+          }
+        }
+      }
+    }
+    
+    // Still unprofitable after waiting - cut loss
+    const finalOtherAsk = getBestAsk(otherTokenId);
+    const finalCombined = finalOtherAsk ? filledPrice + finalOtherAsk.price : wouldPayCombined;
+    const finalLoss = (finalCombined - 1) * 100;
+    
+    console.log(`   [${state.strategy}] ❌ Still unprofitable after waiting (${finalLoss.toFixed(2)}% loss) - cutting loss`);
     await cutLoss(state, filledSide, filledShares);
   }
 }
