@@ -30,6 +30,7 @@ const CONFIG = {
     POSITION_CHECK_INTERVAL_MS: 500,
     CUT_LOSS_MAX_ATTEMPTS: 3,
     STOP_QUOTING_BEFORE_EXPIRY_MS: 5 * 60 * 1000, // Stop new quotes <5 min to expiry
+    VOLATILITY_THRESHOLD: 0.80, // Skip if UP or DOWN >= 80¢
 };
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -299,6 +300,30 @@ async function processMarket(state) {
             await cancelAllOrders();
             state.status = 'IDLE';
         }
+        return;
+    }
+    // Volatility filter - skip if UP or DOWN >= 80¢
+    if (upAsk.price >= CONFIG.VOLATILITY_THRESHOLD || downAsk.price >= CONFIG.VOLATILITY_THRESHOLD) {
+        console.log(`   [${state.strategy}] ⏸️ Volatility: UP=$${upAsk.price.toFixed(2)}, DOWN=$${downAsk.price.toFixed(2)}`);
+        // Cancel any open orders
+        await cancelAllOrders();
+        // Check if we have a one-sided position that needs handling
+        const upPos = await getPosition(state.upTokenId);
+        const downPos = await getPosition(state.downTokenId);
+        if (upPos > 0 && downPos === 0) {
+            console.log(`   [${state.strategy}] ⚠️ One-sided UP during volatility - handling`);
+            stats.oneSidedFills++;
+            await handleOneSidedFill(state, 'UP', state.upBidPrice || upAsk.price, upPos);
+            return;
+        }
+        if (downPos > 0 && upPos === 0) {
+            console.log(`   [${state.strategy}] ⚠️ One-sided DOWN during volatility - handling`);
+            stats.oneSidedFills++;
+            await handleOneSidedFill(state, 'DOWN', state.downBidPrice || downAsk.price, downPos);
+            return;
+        }
+        // No position - just pause
+        state.status = 'IDLE';
         return;
     }
     // Calculate prices

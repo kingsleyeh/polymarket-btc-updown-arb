@@ -46,6 +46,7 @@ async function main() {
     console.log('   📈 LIVE (≤15 min to expiry): Target 3% edge');
     console.log('   📊 PREMARKET (15-30 min to expiry): Target 2% edge');
     console.log('\nRules:');
+    console.log('   ⏸️ Skip if UP or DOWN >= 80¢ (high volatility)');
     console.log('   ⏰ Stop new quotes <5 min before expiry');
     console.log('   ⚠️ One-sided fills handled with risk management');
     console.log('\nBehavior:');
