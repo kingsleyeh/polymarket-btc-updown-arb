@@ -1,10 +1,9 @@
 /**
- * Trade Execution with Smart Retry
+ * SIMPLIFIED Trade Execution
  *
- * RULES:
- * 1. 0 UP, 0 DOWN → can retry (no exposure)
- * 2. X UP = X DOWN → success (done)
- * 3. X UP ≠ Y DOWN → STOP (has exposure, manual fix needed)
+ * 1. Market buy both sides IMMEDIATELY
+ * 2. Auto-reverse any imbalance
+ * 3. Retry until success or manual intervention needed
  */
 import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
@@ -12,7 +11,7 @@ import { ethers } from 'ethers';
 const MIN_SHARES = 5;
 const FILL_TIMEOUT_MS = 3000;
 const POSITION_CHECK_INTERVAL_MS = 200;
-const PRICE_BUFFER_CENTS = 0.01; // Add 1 cent to each side to help fill
+const SETTLEMENT_WAIT_MS = 2000;
 // Polymarket
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -20,24 +19,19 @@ const CLOB_HOST = 'https://clob.polymarket.com';
 let clobClient = null;
 let wallet = null;
 let cachedBalance = 0;
-// Track markets with UNEQUAL exposure - these can NEVER be retried
-const marketsWithExposure = new Set();
-// Track markets we've successfully completed
+// Track markets with failed reversals - these need manual fix
+const brokenMarkets = new Set();
+// Track completed markets
 const completedMarkets = new Set();
 const executedTrades = [];
 /**
  * Check if market can be traded
- * Returns: true if we can attempt, false if blocked
  */
 export function canTradeMarket(marketId) {
-    // Never retry if we have unequal exposure
-    if (marketsWithExposure.has(marketId)) {
+    if (brokenMarkets.has(marketId))
         return false;
-    }
-    // Don't retry completed markets
-    if (completedMarkets.has(marketId)) {
+    if (completedMarkets.has(marketId))
         return false;
-    }
     return true;
 }
 /**
@@ -62,8 +56,6 @@ export async function initializeTrader() {
         const balance = await clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
         cachedBalance = parseFloat(balance.balance || '0') / 1_000_000;
         console.log(`Balance: $${cachedBalance.toFixed(2)} USDC`);
-        console.log(`\n📊 Strategy: DOWN first, then UP (sequential)`);
-        console.log(`   Retry: YES if 0 exposure, NO if unequal exposure`);
         return true;
     }
     catch (error) {
@@ -72,7 +64,7 @@ export async function initializeTrader() {
     }
 }
 /**
- * Check token position
+ * Get token position
  */
 async function getPosition(tokenId) {
     if (!clobClient)
@@ -99,7 +91,77 @@ async function getBothPositions(upTokenId, downTokenId) {
     return { up, down };
 }
 /**
- * Cancel order (best effort)
+ * Market buy - use high price to ensure fill
+ */
+async function marketBuy(tokenId, shares, label) {
+    if (!clobClient)
+        return null;
+    try {
+        console.log(`   📥 Market buying ${shares} ${label}...`);
+        const result = await clobClient.createAndPostOrder({
+            tokenID: tokenId,
+            price: 0.99, // High price = market order
+            size: shares,
+            side: Side.BUY,
+        }).catch(e => ({ error: e }));
+        const orderId = result && !('error' in result) ? result.orderID : null;
+        if (orderId) {
+            console.log(`   ✓ ${label} order placed`);
+        }
+        else {
+            const err = result?.error;
+            console.log(`   ❌ ${label} order failed: ${err?.data?.error || err?.message || 'Unknown'}`);
+        }
+        return orderId;
+    }
+    catch (error) {
+        console.log(`   ❌ ${label} error: ${error.message}`);
+        return null;
+    }
+}
+/**
+ * Market sell - use low price to ensure fill
+ */
+async function marketSell(tokenId, shares, label) {
+    if (!clobClient || shares <= 0)
+        return true; // Nothing to sell = success
+    console.log(`   📤 Market selling ${shares} ${label}...`);
+    // Wait for settlement
+    await new Promise(r => setTimeout(r, SETTLEMENT_WAIT_MS));
+    try {
+        const result = await clobClient.createAndPostOrder({
+            tokenID: tokenId,
+            price: 0.01, // Low price = market sell
+            size: shares,
+            side: Side.SELL,
+        }).catch(e => ({ error: e }));
+        const orderId = result && !('error' in result) ? result.orderID : null;
+        if (orderId) {
+            // Wait for fill
+            await new Promise(r => setTimeout(r, 1000));
+            const remaining = await getPosition(tokenId);
+            if (remaining === 0) {
+                console.log(`   ✓ Sold all ${label}`);
+                return true;
+            }
+            else {
+                console.log(`   ⚠️ Still have ${remaining} ${label}`);
+                return false;
+            }
+        }
+        else {
+            const err = result?.error;
+            console.log(`   ❌ Sell failed: ${err?.data?.error || err?.message || 'Unknown'}`);
+            return false;
+        }
+    }
+    catch (error) {
+        console.log(`   ❌ Sell error: ${error.message}`);
+        return false;
+    }
+}
+/**
+ * Cancel order
  */
 async function cancelOrder(orderId) {
     if (!clobClient)
@@ -110,72 +172,53 @@ async function cancelOrder(orderId) {
     catch { }
 }
 /**
- * Sell position to reverse exposure
- * Waits for settlement then market sells
+ * Wait for position
  */
-async function sellPosition(tokenId, shares, label) {
-    if (!clobClient || shares <= 0)
-        return false;
-    console.log(`   🔄 Waiting 2s for token settlement...`);
-    await new Promise(r => setTimeout(r, 2000)); // Wait for settlement
-    try {
-        // Sell at low price to ensure fill (market sell)
-        const sellPrice = 0.01; // Very low price = market sell
-        console.log(`   📤 Selling ${shares} ${label} @ $${sellPrice}...`);
-        const result = await clobClient.createAndPostOrder({
-            tokenID: tokenId,
-            price: sellPrice,
-            size: shares,
-            side: Side.SELL,
-        }).catch(e => ({ error: e }));
-        const orderId = result && !('error' in result) ? result.orderID : null;
-        if (!orderId) {
-            const err = result?.error;
-            console.log(`   ❌ Sell failed: ${err?.data?.error || err?.message || 'Unknown'}`);
-            return false;
-        }
-        // Wait for sell to fill
-        await new Promise(r => setTimeout(r, 1000));
-        // Check if position is gone
-        const remaining = await getPosition(tokenId);
-        if (remaining === 0) {
-            console.log(`   ✅ Sold all ${label} - back to 0 exposure`);
-            return true;
-        }
-        else {
-            console.log(`   ⚠️ Still have ${remaining} ${label} remaining`);
-            return false;
-        }
-    }
-    catch (error) {
-        console.log(`   ❌ Sell error: ${error.message}`);
-        return false;
-    }
-}
-/**
- * Wait for position to appear
- */
-async function waitForPosition(tokenId, minShares, timeoutMs) {
+async function waitForFill(tokenId, targetShares, timeoutMs) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
         const pos = await getPosition(tokenId);
-        if (pos >= minShares)
-            return pos;
+        if (pos >= targetShares)
+            return true;
         await new Promise(r => setTimeout(r, POSITION_CHECK_INTERVAL_MS));
     }
-    return await getPosition(tokenId);
+    return false;
 }
 /**
- * Execute trade - with smart retry logic
+ * Reverse all positions to get back to 0
+ */
+async function reverseToZero(upTokenId, downTokenId) {
+    console.log(`   🔄 Reversing to 0...`);
+    const pos = await getBothPositions(upTokenId, downTokenId);
+    let success = true;
+    if (pos.up > 0) {
+        if (!await marketSell(upTokenId, pos.up, 'UP'))
+            success = false;
+    }
+    if (pos.down > 0) {
+        if (!await marketSell(downTokenId, pos.down, 'DOWN'))
+            success = false;
+    }
+    const final = await getBothPositions(upTokenId, downTokenId);
+    if (final.up === 0 && final.down === 0) {
+        console.log(`   ✅ Back to 0 - can retry`);
+        return true;
+    }
+    else {
+        console.log(`   ❌ Reversal failed: ${final.up} UP, ${final.down} DOWN`);
+        return false;
+    }
+}
+/**
+ * Execute trade - SIMPLE VERSION
  */
 export async function executeTrade(arb) {
     if (!clobClient || !wallet) {
         console.error('Not initialized');
         return null;
     }
-    // Check if this market is blocked
-    if (marketsWithExposure.has(arb.market_id)) {
-        console.log(`   ⛔ Market blocked (has unequal exposure)`);
+    if (brokenMarkets.has(arb.market_id)) {
+        console.log(`   ⛔ Market broken - manual fix needed`);
         return null;
     }
     if (completedMarkets.has(arb.market_id)) {
@@ -190,197 +233,95 @@ export async function executeTrade(arb) {
         has_exposure: false,
         can_retry: true,
     };
-    // Check current positions FIRST
+    // Check current positions
     const startPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     console.log(`   📊 Current: ${startPos.up} UP, ${startPos.down} DOWN`);
+    // If imbalanced, auto-reverse FIRST
     if (startPos.up !== startPos.down) {
-        console.log(`   🚨 Already have unequal exposure! Blocking market.`);
-        marketsWithExposure.add(arb.market_id);
-        trade.has_exposure = true;
-        trade.can_retry = false;
-        trade.error = `Pre-existing imbalance: ${startPos.up} UP, ${startPos.down} DOWN`;
+        console.log(`   ⚠️ Imbalanced - auto-reversing first...`);
+        const reversed = await reverseToZero(arb.up_token_id, arb.down_token_id);
+        if (!reversed) {
+            console.log(`   ❌ Could not reverse - market broken`);
+            brokenMarkets.add(arb.market_id);
+            trade.has_exposure = true;
+            trade.can_retry = false;
+            trade.error = 'Reversal failed';
+            executedTrades.push(trade);
+            return trade;
+        }
+        // Update start position
+        const newStart = await getBothPositions(arb.up_token_id, arb.down_token_id);
+        console.log(`   📊 After reversal: ${newStart.up} UP, ${newStart.down} DOWN`);
+    }
+    // ===== MARKET BUY BOTH SIDES =====
+    console.log(`\n   🚀 EXECUTING: Buy ${MIN_SHARES} of each side`);
+    // Place both orders
+    const downOrderId = await marketBuy(arb.down_token_id, MIN_SHARES, 'DOWN');
+    const upOrderId = await marketBuy(arb.up_token_id, MIN_SHARES, 'UP');
+    if (!downOrderId && !upOrderId) {
+        console.log(`   ❌ Both orders failed`);
+        trade.error = 'Both orders failed';
+        trade.can_retry = true;
         executedTrades.push(trade);
         return trade;
     }
-    // Use scan prices + tiny buffer (1 cent each side)
-    const downLimit = Math.min(arb.down_price + PRICE_BUFFER_CENTS, 0.99);
-    const upLimit = Math.min(arb.up_price + PRICE_BUFFER_CENTS, 0.99);
-    console.log(`   💵 Limits: DOWN=$${downLimit.toFixed(3)} UP=$${upLimit.toFixed(3)}`);
-    try {
-        // ===== STEP 1: Place DOWN order =====
-        console.log(`\n   📥 STEP 1: Buying ${MIN_SHARES} DOWN @ $${downLimit.toFixed(3)}...`);
-        const downResult = await clobClient.createAndPostOrder({
-            tokenID: arb.down_token_id,
-            price: downLimit,
-            size: MIN_SHARES,
-            side: Side.BUY,
-        }).catch(e => ({ error: e }));
-        const downOrderId = downResult && !('error' in downResult) ? downResult.orderID : null;
-        if (!downOrderId) {
-            console.log(`   ❌ DOWN order failed to submit`);
-            trade.error = 'DOWN order failed';
-            trade.can_retry = true; // No order placed, safe to retry
-            executedTrades.push(trade);
-            return trade;
-        }
-        console.log(`   ✓ DOWN order placed`);
-        // Wait for DOWN to fill
-        console.log(`   ⏳ Waiting for DOWN fill...`);
-        await waitForPosition(arb.down_token_id, startPos.down + 1, FILL_TIMEOUT_MS);
-        // Cancel remaining order
+    // Wait for fills
+    console.log(`   ⏳ Waiting for fills...`);
+    await new Promise(r => setTimeout(r, FILL_TIMEOUT_MS));
+    // Cancel any unfilled orders
+    if (downOrderId)
         await cancelOrder(downOrderId);
-        // Check positions after DOWN attempt
-        const afterDown = await getBothPositions(arb.up_token_id, arb.down_token_id);
-        const newDownShares = afterDown.down - startPos.down;
-        console.log(`   📊 After DOWN: ${afterDown.up} UP, ${afterDown.down} DOWN (got ${newDownShares} new)`);
-        if (newDownShares === 0) {
-            // No DOWN filled - check if still equal
-            if (afterDown.up === afterDown.down) {
-                console.log(`   ✓ No fills - safe to retry`);
-                trade.error = 'DOWN did not fill';
-                trade.can_retry = true;
-                executedTrades.push(trade);
-                return trade;
-            }
-            else {
-                // Something weird happened
-                console.log(`   🚨 Positions changed unexpectedly!`);
-                marketsWithExposure.add(arb.market_id);
-                trade.has_exposure = true;
-                trade.can_retry = false;
-                trade.error = `Unexpected: ${afterDown.up} UP, ${afterDown.down} DOWN`;
-                executedTrades.push(trade);
-                return trade;
-            }
-        }
-        // Got some DOWN - now must get same amount of UP
-        console.log(`   ✅ Got ${newDownShares} DOWN - now need ${newDownShares} UP`);
-        // ===== STEP 2: Place UP order for EXACT same amount =====
-        console.log(`\n   📥 STEP 2: Buying ${newDownShares} UP @ $${upLimit.toFixed(3)}...`);
-        const upResult = await clobClient.createAndPostOrder({
-            tokenID: arb.up_token_id,
-            price: upLimit,
-            size: newDownShares, // EXACT same as DOWN we got
-            side: Side.BUY,
-        }).catch(e => ({ error: e }));
-        const upOrderId = upResult && !('error' in upResult) ? upResult.orderID : null;
-        if (!upOrderId) {
-            console.log(`   ❌ UP order failed to submit`);
-            console.log(`   🚨 Have ${afterDown.down} DOWN, ${afterDown.up} UP - attempting reversal...`);
-            // Try to sell the DOWN we just bought
-            const sold = await sellPosition(arb.down_token_id, newDownShares, 'DOWN');
-            const checkAfterSell = await getBothPositions(arb.up_token_id, arb.down_token_id);
-            if (checkAfterSell.up === checkAfterSell.down) {
-                console.log(`   ✅ Reversal successful - back to balanced (can retry)`);
-                trade.has_exposure = false;
-                trade.can_retry = true;
-                trade.error = 'UP failed, reversed DOWN';
-                executedTrades.push(trade);
-                return trade;
-            }
-            else {
-                console.log(`   ❌ Reversal failed - manual intervention needed`);
-                marketsWithExposure.add(arb.market_id);
-                trade.has_exposure = true;
-                trade.can_retry = false;
-                trade.error = `Reversal failed: ${checkAfterSell.up} UP, ${checkAfterSell.down} DOWN`;
-                executedTrades.push(trade);
-                return trade;
-            }
-        }
-        console.log(`   ✓ UP order placed`);
-        // Wait for UP to fill
-        console.log(`   ⏳ Waiting for UP fill...`);
-        await waitForPosition(arb.up_token_id, startPos.up + newDownShares, FILL_TIMEOUT_MS);
-        // Cancel remaining
+    if (upOrderId)
         await cancelOrder(upOrderId);
-        // Final position check
-        const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
-        console.log(`\n   📊 FINAL: ${finalPos.up} UP, ${finalPos.down} DOWN`);
-        if (finalPos.up === finalPos.down && finalPos.up > startPos.up) {
-            // SUCCESS!
-            const newShares = finalPos.up - startPos.up;
-            console.log(`   ✅✅ SUCCESS! Got ${newShares} of each`);
-            completedMarkets.add(arb.market_id);
-            trade.status = 'filled';
-            trade.shares = newShares;
-            trade.has_exposure = false;
-            trade.can_retry = false;
-            executedTrades.push(trade);
-            return trade;
-        }
-        // Imbalanced - attempt auto-reversal
-        console.log(`   🚨 IMBALANCED: ${finalPos.up} UP ≠ ${finalPos.down} DOWN`);
-        console.log(`   🔄 Attempting auto-reversal to 0...`);
-        // Sell everything to get back to 0
-        let reversed = true;
-        if (finalPos.up > 0) {
-            const soldUp = await sellPosition(arb.up_token_id, finalPos.up, 'UP');
-            if (!soldUp)
-                reversed = false;
-        }
-        if (finalPos.down > 0) {
-            const soldDown = await sellPosition(arb.down_token_id, finalPos.down, 'DOWN');
-            if (!soldDown)
-                reversed = false;
-        }
-        // Check final state
-        const afterReversal = await getBothPositions(arb.up_token_id, arb.down_token_id);
-        if (afterReversal.up === 0 && afterReversal.down === 0) {
-            console.log(`   ✅ Reversal successful - back to 0 (can retry)`);
-            trade.has_exposure = false;
-            trade.can_retry = true;
-            trade.error = 'Imbalanced but reversed to 0';
-            executedTrades.push(trade);
-            return trade;
-        }
-        else if (afterReversal.up === afterReversal.down) {
-            console.log(`   ✅ Positions balanced: ${afterReversal.up} each (can retry)`);
-            trade.has_exposure = false;
-            trade.can_retry = true;
-            trade.error = 'Balanced after reversal';
-            executedTrades.push(trade);
-            return trade;
-        }
-        else {
-            console.log(`   ❌ Reversal failed: ${afterReversal.up} UP, ${afterReversal.down} DOWN`);
-            console.log(`   👉 Manual fix on polymarket.com`);
-            marketsWithExposure.add(arb.market_id);
-            trade.has_exposure = true;
-            trade.can_retry = false;
-            trade.shares = Math.max(afterReversal.up, afterReversal.down);
-            trade.error = `Reversal failed: ${afterReversal.up} UP, ${afterReversal.down} DOWN`;
-            executedTrades.push(trade);
-            return trade;
-        }
+    // Check final positions
+    const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
+    console.log(`\n   📊 RESULT: ${finalPos.up} UP, ${finalPos.down} DOWN`);
+    // SUCCESS: Equal non-zero positions
+    if (finalPos.up === finalPos.down && finalPos.up >= MIN_SHARES) {
+        console.log(`   ✅✅ SUCCESS! ${finalPos.up} UP = ${finalPos.down} DOWN`);
+        completedMarkets.add(arb.market_id);
+        trade.status = 'filled';
+        trade.shares = finalPos.up;
+        trade.has_exposure = false;
+        trade.can_retry = false;
+        executedTrades.push(trade);
+        return trade;
     }
-    catch (error) {
-        console.error(`   ❌ Error: ${error.message}`);
-        // Check positions
-        const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
-        if (finalPos.up === finalPos.down) {
-            trade.can_retry = true;
-            trade.error = error.message;
-            executedTrades.push(trade);
-            return trade;
-        }
-        // Imbalanced - try reversal
-        console.log(`   🔄 Error caused imbalance, attempting reversal...`);
-        if (finalPos.up > 0)
-            await sellPosition(arb.up_token_id, finalPos.up, 'UP');
-        if (finalPos.down > 0)
-            await sellPosition(arb.down_token_id, finalPos.down, 'DOWN');
-        const afterReversal = await getBothPositions(arb.up_token_id, arb.down_token_id);
-        if (afterReversal.up === afterReversal.down) {
-            trade.can_retry = true;
-            trade.error = `Error reversed: ${error.message}`;
-        }
-        else {
-            marketsWithExposure.add(arb.market_id);
-            trade.has_exposure = true;
-            trade.can_retry = false;
-            trade.error = `Error + reversal failed: ${afterReversal.up} UP, ${afterReversal.down} DOWN`;
-        }
+    // PARTIAL SUCCESS: Equal but less than MIN_SHARES
+    if (finalPos.up === finalPos.down && finalPos.up > 0) {
+        console.log(`   ✅ Partial: ${finalPos.up} each (less than ${MIN_SHARES})`);
+        completedMarkets.add(arb.market_id);
+        trade.status = 'filled';
+        trade.shares = finalPos.up;
+        trade.has_exposure = false;
+        trade.can_retry = false;
+        executedTrades.push(trade);
+        return trade;
+    }
+    // ZERO: Nothing filled - can retry
+    if (finalPos.up === 0 && finalPos.down === 0) {
+        console.log(`   ⚠️ Nothing filled - can retry`);
+        trade.error = 'No fills';
+        trade.can_retry = true;
+        executedTrades.push(trade);
+        return trade;
+    }
+    // IMBALANCED: Auto-reverse
+    console.log(`   🚨 Imbalanced! Auto-reversing...`);
+    const reversed = await reverseToZero(arb.up_token_id, arb.down_token_id);
+    if (reversed) {
+        console.log(`   ✓ Reversed - can retry`);
+        trade.error = 'Imbalanced but reversed';
+        trade.can_retry = true;
+        executedTrades.push(trade);
+        return trade;
+    }
+    else {
+        console.log(`   ❌ Reversal failed - manual fix needed`);
+        brokenMarkets.add(arb.market_id);
+        trade.has_exposure = true;
+        trade.can_retry = false;
+        trade.error = 'Reversal failed';
         executedTrades.push(trade);
         return trade;
     }

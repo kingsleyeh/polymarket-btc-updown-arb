@@ -1,10 +1,9 @@
 /**
- * Trade Execution with Smart Retry
+ * SIMPLIFIED Trade Execution
  *
- * RULES:
- * 1. 0 UP, 0 DOWN → can retry (no exposure)
- * 2. X UP = X DOWN → success (done)
- * 3. X UP ≠ Y DOWN → STOP (has exposure, manual fix needed)
+ * 1. Market buy both sides IMMEDIATELY
+ * 2. Auto-reverse any imbalance
+ * 3. Retry until success or manual intervention needed
  */
 import { ArbitrageOpportunity } from '../types/arbitrage';
 interface ExecutedTrade {
@@ -18,7 +17,6 @@ interface ExecutedTrade {
 }
 /**
  * Check if market can be traded
- * Returns: true if we can attempt, false if blocked
  */
 export declare function canTradeMarket(marketId: string): boolean;
 /**
@@ -26,7 +24,7 @@ export declare function canTradeMarket(marketId: string): boolean;
  */
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * Execute trade - with smart retry logic
+ * Execute trade - SIMPLE VERSION
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {
