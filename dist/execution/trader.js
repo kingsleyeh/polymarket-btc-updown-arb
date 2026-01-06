@@ -4,7 +4,7 @@
  * TRUE market orders: buy at $0.99 to take ANY available ask
  * Minimal waits - speed is everything
  */
-import { ClobClient, Side, AssetType } from '@polymarket/clob-client';
+import { ClobClient, Side, AssetType, OrderType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 const MIN_SHARES = 5;
 const SETTLEMENT_WAIT_MS = 1500; // Only needed for sells (token settlement)
@@ -79,51 +79,35 @@ async function cancelAllOrders() {
     catch { }
 }
 /**
- * TRUE MARKET BUY - price $0.99 takes any ask INSTANTLY
+ * TRUE MARKET BUY using FAK (Fill and Kill) - INSTANT execution
  */
-async function marketBuy(tokenId, shares, label) {
+async function marketBuy(tokenId, shares, price, label) {
     if (!clobClient)
         return { orderId: null, filled: 0 };
     const startTime = Date.now();
     const startPos = await getPosition(tokenId);
-    console.log(`   📥 ${label}: MARKET BUY ${shares}`);
+    // For market orders, amount = dollars to spend (price * shares)
+    const dollarAmount = price * shares * 1.05; // 5% buffer
+    console.log(`   📥 ${label}: MARKET BUY $${dollarAmount.toFixed(2)}`);
     try {
-        const result = await clobClient.createAndPostOrder({
+        // Use createAndPostMarketOrder for FAK (Fill and Kill)
+        const result = await clobClient.createAndPostMarketOrder({
             tokenID: tokenId,
-            price: 0.99, // TRUE MARKET ORDER - takes any ask
-            size: shares,
+            amount: dollarAmount,
             side: Side.BUY,
-        }).catch(e => ({ error: e }));
-        const orderId = result && !('error' in result) ? result.orderID : null;
+        }, {}, OrderType.FAK).catch(e => ({ error: e }));
         const orderTime = Date.now() - startTime;
-        if (!orderId) {
+        if (!result || 'error' in result) {
             const err = result?.error;
             console.log(`   ❌ ${label}: Failed (${orderTime}ms) - ${err?.data?.error || err?.message || 'Unknown'}`);
             return { orderId: null, filled: 0 };
         }
-        // Market orders fill instantly - check immediately
-        // Try order status first (most accurate)
-        let filled = 0;
-        try {
-            const order = await clobClient.getOrder(orderId);
-            if (order) {
-                filled = Math.floor(parseFloat(order.size_matched || '0'));
-            }
-        }
-        catch { }
-        // Cancel any unfilled remainder
-        try {
-            await clobClient.cancelOrder({ orderID: orderId });
-        }
-        catch { }
-        // Double-check with position if order status showed 0
-        if (filled === 0) {
-            const endPos = await getPosition(tokenId);
-            filled = endPos - startPos;
-        }
+        // Check position to see what we got
+        const endPos = await getPosition(tokenId);
+        const filled = endPos - startPos;
         const totalTime = Date.now() - startTime;
         console.log(`   ✓ ${label}: ${filled} shares (${totalTime}ms)`);
-        return { orderId, filled };
+        return { orderId: result.orderID || null, filled };
     }
     catch (error) {
         console.log(`   ❌ ${label}: ${error.message}`);
@@ -131,42 +115,57 @@ async function marketBuy(tokenId, shares, label) {
     }
 }
 /**
- * MARKET SELL at $0.01
+ * MARKET SELL using FAK - retry up to 3 times with increasing settlement wait
  */
 async function marketSell(tokenId, shares, label) {
     if (!clobClient || shares <= 0)
         return true;
-    console.log(`   📤 ${label}: MARKET SELL ${shares} @ $0.01`);
-    // Must wait for settlement
-    await new Promise(r => setTimeout(r, SETTLEMENT_WAIT_MS));
-    try {
-        const result = await clobClient.createAndPostOrder({
-            tokenID: tokenId,
-            price: 0.01,
-            size: shares,
-            side: Side.SELL,
-        }).catch(e => ({ error: e }));
-        if (!result || 'error' in result) {
-            const err = result?.error;
-            console.log(`   ❌ ${label}: Sell failed - ${err?.data?.error || err?.message || 'Unknown'}`);
-            return false;
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const waitTime = attempt * 2000; // 2s, 4s, 6s
+        console.log(`   📤 ${label}: SELL ${shares} (attempt ${attempt}, wait ${waitTime}ms)`);
+        // Must wait for settlement - increases with each retry
+        await new Promise(r => setTimeout(r, waitTime));
+        try {
+            // For SELL, amount = number of shares
+            const result = await clobClient.createAndPostMarketOrder({
+                tokenID: tokenId,
+                amount: shares,
+                side: Side.SELL,
+            }, {}, OrderType.FAK).catch(e => ({ error: e }));
+            if (!result || 'error' in result) {
+                const err = result?.error;
+                const errMsg = err?.data?.error || err?.message || 'Unknown';
+                console.log(`   ❌ ${label}: Failed - ${errMsg}`);
+                // If it's a balance/allowance error, wait longer and retry
+                if (errMsg.includes('balance') || errMsg.includes('allowance')) {
+                    console.log(`   ⏳ Token not settled yet, retrying...`);
+                    continue;
+                }
+                continue; // Try again anyway
+            }
+            console.log(`   ✓ ${label}: Sell order executed`);
+            const remaining = await getPosition(tokenId);
+            if (remaining === 0) {
+                console.log(`   ✅ ${label}: Sold all`);
+                return true;
+            }
+            else if (remaining < shares) {
+                console.log(`   ⚠️ ${label}: Partial - ${remaining} remaining, retrying...`);
+                shares = remaining;
+                continue;
+            }
+            else {
+                console.log(`   ⚠️ ${label}: ${remaining} remaining`);
+                continue;
+            }
         }
-        // Wait for sell to process
-        await new Promise(r => setTimeout(r, 1000));
-        const remaining = await getPosition(tokenId);
-        if (remaining === 0) {
-            console.log(`   ✓ ${label}: Sold all`);
-            return true;
-        }
-        else {
-            console.log(`   ⚠️ ${label}: ${remaining} remaining`);
-            return false;
+        catch (e) {
+            console.log(`   ❌ ${label}: ${e.message}`);
         }
     }
-    catch (e) {
-        console.log(`   ❌ ${label}: ${e.message}`);
-        return false;
-    }
+    const finalRemaining = await getPosition(tokenId);
+    return finalRemaining === 0;
 }
 async function reverseToZero(upTokenId, downTokenId) {
     await cancelAllOrders();
@@ -222,7 +221,7 @@ export async function executeTrade(arb) {
     }
     console.log(`\n   ⚡ MARKET ORDERS: ${MIN_SHARES} shares`);
     // STEP 1: Market buy DOWN
-    const downResult = await marketBuy(arb.down_token_id, MIN_SHARES, 'DOWN');
+    const downResult = await marketBuy(arb.down_token_id, MIN_SHARES, arb.down_price, 'DOWN');
     if (downResult.filled === 0) {
         console.log(`   ⚠️ No DOWN fills - retrying...`);
         trade.error = 'No DOWN fills';
@@ -232,7 +231,7 @@ export async function executeTrade(arb) {
     }
     // STEP 2: Market buy EXACT same UP
     console.log(`   📊 Got ${downResult.filled} DOWN → buying ${downResult.filled} UP`);
-    const upResult = await marketBuy(arb.up_token_id, downResult.filled, 'UP');
+    const upResult = await marketBuy(arb.up_token_id, downResult.filled, arb.up_price, 'UP');
     // FINAL CHECK
     const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     const totalTime = Date.now() - startTime;
