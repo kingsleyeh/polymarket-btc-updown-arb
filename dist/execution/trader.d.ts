@@ -1,7 +1,7 @@
 /**
- * ORDER BOOK AWARE EXECUTION
+ * ORDER BOOK AWARE EXECUTION with WebSocket
  *
- * 1. Fetch real order book to get exact ask prices
+ * 1. Real-time order book via WebSocket (no fetch latency)
  * 2. Place orders at actual ask (instant fill)
  * 3. Fast polling (500ms) with early exit
  *
@@ -21,7 +21,11 @@ interface ExecutedTrade {
 export declare function canTradeMarket(marketId: string): boolean;
 export declare function initializeTrader(): Promise<boolean>;
 /**
- * MAIN EXECUTION - Order Book Aware
+ * Subscribe to order book updates for market tokens
+ */
+export declare function subscribeToMarketOrderBooks(upTokenId: string, downTokenId: string): void;
+/**
+ * MAIN EXECUTION - Order Book Aware with WebSocket
  */
 export declare function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null>;
 export declare function getExecutionStats(): {
@@ -34,5 +38,6 @@ export declare function getExecutionStats(): {
 };
 export declare function isTraderReady(): boolean;
 export declare function getBalance(): Promise<number>;
+export declare function shutdownTrader(): void;
 export {};
 //# sourceMappingURL=trader.d.ts.map

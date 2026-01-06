@@ -11,7 +11,7 @@ import { scanBTCUpDownMarkets, getMarketSummary } from './crypto/scanner';
 import { fetchMarketPrices, checkArbitrage, updateArbTracking } from './crypto/arbitrage';
 import { initializeLogFiles, incrementScanCount, incrementArbCount, getScanStats, resetStats, } from './crypto/arb-logger';
 import { startDashboardServer, pushLog, updateStats } from './dashboard/server';
-import { initializeTrader, executeTrade, getExecutionStats, isTraderReady, canTradeMarket } from './execution/trader';
+import { initializeTrader, executeTrade, getExecutionStats, isTraderReady, canTradeMarket, subscribeToMarketOrderBooks, shutdownTrader } from './execution/trader';
 import { SCAN_INTERVAL_MS, MIN_EDGE, EXPIRY_CUTOFF_SECONDS } from './config/constants';
 // Load environment variables
 dotenv.config();
@@ -60,6 +60,10 @@ class BTCUpDownArbBot {
             const summary = getMarketSummary(this.markets);
             log(`✓ Found ${summary.total} BTC Up/Down markets`);
             log(`  Time to expiry: ${Math.round(summary.avg_time_to_expiry / 60)} minutes`);
+            // Subscribe to WebSocket order books for real-time data
+            for (const market of this.markets) {
+                subscribeToMarketOrderBooks(market.up_token_id, market.down_token_id);
+            }
             updateStats({
                 marketsCount: summary.total,
             });
@@ -91,6 +95,10 @@ class BTCUpDownArbBot {
         // Refresh markets every 30 seconds
         setInterval(async () => {
             this.markets = await scanBTCUpDownMarkets();
+            // Subscribe to any new markets
+            for (const market of this.markets) {
+                subscribeToMarketOrderBooks(market.up_token_id, market.down_token_id);
+            }
             updateStats({ marketsCount: this.markets.length });
         }, 30 * 1000);
         log('✓ Bot is running - monitoring for arbitrage');
@@ -254,6 +262,8 @@ class BTCUpDownArbBot {
             clearInterval(this.scanInterval);
             this.scanInterval = null;
         }
+        // Shutdown WebSocket connections
+        shutdownTrader();
         // Print final report
         const report = this.generateSessionReport();
         console.log('\n' + report);

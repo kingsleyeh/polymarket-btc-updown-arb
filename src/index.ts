@@ -21,7 +21,7 @@ import {
   resetStats,
 } from './crypto/arb-logger';
 import { startDashboardServer, pushLog, updateStats } from './dashboard/server';
-import { initializeTrader, executeTrade, getExecutionStats, isTraderReady, canTradeMarket } from './execution/trader';
+import { initializeTrader, executeTrade, getExecutionStats, isTraderReady, canTradeMarket, subscribeToMarketOrderBooks, shutdownTrader } from './execution/trader';
 import { UpDownMarket } from './types/arbitrage';
 import { SCAN_INTERVAL_MS, MIN_EDGE, EXPIRY_CUTOFF_SECONDS } from './config/constants';
 
@@ -81,6 +81,11 @@ class BTCUpDownArbBot {
       log(`✓ Found ${summary.total} BTC Up/Down markets`);
       log(`  Time to expiry: ${Math.round(summary.avg_time_to_expiry / 60)} minutes`);
       
+      // Subscribe to WebSocket order books for real-time data
+      for (const market of this.markets) {
+        subscribeToMarketOrderBooks(market.up_token_id, market.down_token_id);
+      }
+      
       updateStats({
         marketsCount: summary.total,
       });
@@ -123,6 +128,10 @@ class BTCUpDownArbBot {
     // Refresh markets every 30 seconds
     setInterval(async () => {
       this.markets = await scanBTCUpDownMarkets();
+      // Subscribe to any new markets
+      for (const market of this.markets) {
+        subscribeToMarketOrderBooks(market.up_token_id, market.down_token_id);
+      }
       updateStats({ marketsCount: this.markets.length });
     }, 30 * 1000);
 
@@ -313,6 +322,9 @@ class BTCUpDownArbBot {
       clearInterval(this.scanInterval);
       this.scanInterval = null;
     }
+
+    // Shutdown WebSocket connections
+    shutdownTrader();
 
     // Print final report
     const report = this.generateSessionReport();

@@ -1,7 +1,7 @@
 /**
- * ORDER BOOK AWARE EXECUTION
+ * ORDER BOOK AWARE EXECUTION with WebSocket
  *
- * 1. Fetch real order book to get exact ask prices
+ * 1. Real-time order book via WebSocket (no fetch latency)
  * 2. Place orders at actual ask (instant fill)
  * 3. Fast polling (500ms) with early exit
  *
@@ -9,6 +9,7 @@
  */
 import { ClobClient, Side, AssetType, OrderType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
+import { connectOrderBookWebSocket, subscribeToTokens, getPriceForShares, hasFreshCache, disconnectOrderBookWebSocket } from './orderbook-ws';
 const MIN_SHARES = 5;
 const POLL_INTERVAL_MS = 500; // Fast polling
 const MAX_WAIT_MS = 3000; // Max wait for fills
@@ -43,6 +44,8 @@ export async function initializeTrader() {
         const balance = await clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
         cachedBalance = parseFloat(balance.balance || '0') / 1_000_000;
         console.log(`Balance: $${cachedBalance.toFixed(2)} USDC`);
+        // Connect WebSocket for real-time order books
+        await connectOrderBookWebSocket();
         return true;
     }
     catch (error) {
@@ -51,13 +54,15 @@ export async function initializeTrader() {
     }
 }
 /**
- * Get the REAL ask price from order book to fill N shares
- * Returns price and available liquidity
- *
- * NOTE: Polymarket asks are sorted DESCENDING (highest first)
- * So we need to read from the END to get best (lowest) asks
+ * Subscribe to order book updates for market tokens
  */
-async function getOrderBookAsk(tokenId, sharesNeeded, label) {
+export function subscribeToMarketOrderBooks(upTokenId, downTokenId) {
+    subscribeToTokens([upTokenId, downTokenId]);
+}
+/**
+ * Fallback: Fetch order book via REST if WebSocket cache is stale
+ */
+async function getOrderBookAskREST(tokenId, sharesNeeded, label) {
     if (!clobClient)
         return null;
     try {
@@ -66,12 +71,8 @@ async function getOrderBookAsk(tokenId, sharesNeeded, label) {
             console.log(`   ⚠️ ${label}: No asks in order book`);
             return null;
         }
-        // Asks are sorted DESCENDING (highest/worst first, lowest/best last)
-        // Reverse to get best asks first
-        const sortedAsks = [...book.asks].reverse();
-        const bestAsk = sortedAsks[0];
-        console.log(`   📖 ${label}: Best ask $${bestAsk.price} (${parseFloat(bestAsk.size).toFixed(1)} shares)`);
-        // Walk through asks (now sorted best-first) to find price for our shares
+        // Sort asks ascending (best/lowest first)
+        const sortedAsks = [...book.asks].sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
         let sharesAccum = 0;
         let worstPriceNeeded = 0;
         for (const ask of sortedAsks) {
@@ -80,12 +81,10 @@ async function getOrderBookAsk(tokenId, sharesNeeded, label) {
             sharesAccum += askSize;
             worstPriceNeeded = askPrice;
             if (sharesAccum >= sharesNeeded) {
-                // We have enough liquidity
+                console.log(`   📖 ${label}: $${worstPriceNeeded.toFixed(3)} (REST fallback)`);
                 return { price: worstPriceNeeded, available: sharesAccum };
             }
         }
-        // Not enough liquidity at any price
-        console.log(`   ⚠️ ${label}: Only ${sharesAccum.toFixed(1)} shares available`);
         return { price: worstPriceNeeded, available: sharesAccum };
     }
     catch (error) {
@@ -164,16 +163,14 @@ async function waitForBothPositions(upTokenId, downTokenId, targetShares) {
         if (pos.up >= targetShares && pos.down >= targetShares) {
             return { ...pos, timeMs: Date.now() - startTime };
         }
-        // Early exit if both sides have SOME shares (partial is better than waiting)
+        // Early exit if both sides have SOME shares
         if (pos.up > 0 && pos.down > 0) {
-            // Give it one more poll to see if it completes
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
             const pos2 = await getBothPositions(upTokenId, downTokenId);
             return { ...pos2, timeMs: Date.now() - startTime };
         }
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
     }
-    // Final check after timeout
     const finalPos = await getBothPositions(upTokenId, downTokenId);
     return { ...finalPos, timeMs: Date.now() - startTime };
 }
@@ -194,7 +191,6 @@ async function sellPosition(tokenId, shares, label) {
         });
         const result = await clobClient.postOrder(order, OrderType.GTC);
         if (result && result.orderID) {
-            // Quick wait then check
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS * 2));
             const remaining = await getPosition(tokenId);
             return remaining < shares;
@@ -207,7 +203,7 @@ async function sellPosition(tokenId, shares, label) {
     }
 }
 /**
- * MAIN EXECUTION - Order Book Aware
+ * MAIN EXECUTION - Order Book Aware with WebSocket
  */
 export async function executeTrade(arb) {
     if (!clobClient || !wallet)
@@ -238,7 +234,6 @@ export async function executeTrade(arb) {
             executedTrades.push(trade);
             return trade;
         }
-        // Clear imbalanced positions
         console.log(`   🔄 Clearing...`);
         if (startPos.up > 0)
             await sellPosition(arb.up_token_id, startPos.up, 'UP');
@@ -255,14 +250,25 @@ export async function executeTrade(arb) {
             return trade;
         }
     }
-    // STEP 1: GET REAL ORDER BOOK PRICES
-    console.log(`\n   📖 Fetching order books...`);
-    const [upBook, downBook] = await Promise.all([
-        getOrderBookAsk(arb.up_token_id, MIN_SHARES, 'UP'),
-        getOrderBookAsk(arb.down_token_id, MIN_SHARES, 'DOWN')
-    ]);
+    // STEP 1: GET ORDER BOOK PRICES (WebSocket cache or REST fallback)
+    let upBook = null;
+    let downBook = null;
+    // Try WebSocket cache first (INSTANT)
+    if (hasFreshCache(arb.up_token_id, arb.down_token_id)) {
+        console.log(`\n   📡 Using WebSocket cache (instant)`);
+        upBook = getPriceForShares(arb.up_token_id, MIN_SHARES, 'UP');
+        downBook = getPriceForShares(arb.down_token_id, MIN_SHARES, 'DOWN');
+    }
+    // Fallback to REST if cache miss
     if (!upBook || !downBook) {
-        console.log(`   ❌ Could not fetch order book`);
+        console.log(`\n   📖 Fetching order books (REST fallback)...`);
+        [upBook, downBook] = await Promise.all([
+            getOrderBookAskREST(arb.up_token_id, MIN_SHARES, 'UP'),
+            getOrderBookAskREST(arb.down_token_id, MIN_SHARES, 'DOWN')
+        ]);
+    }
+    if (!upBook || !downBook) {
+        console.log(`   ❌ Could not get order book`);
         trade.error = 'No order book';
         trade.can_retry = true;
         executedTrades.push(trade);
@@ -276,13 +282,12 @@ export async function executeTrade(arb) {
         executedTrades.push(trade);
         return trade;
     }
-    // VALIDATE ARB IS STILL REAL at actual ask prices
+    // VALIDATE ARB IS STILL REAL
     const realCost = upBook.price + downBook.price;
     const realEdge = (1 - realCost) * 100;
-    console.log(`   📊 Real prices: UP=$${upBook.price.toFixed(3)} + DOWN=$${downBook.price.toFixed(3)} = $${realCost.toFixed(4)}`);
-    console.log(`   📈 Real edge: ${realEdge.toFixed(2)}%`);
+    console.log(`   📊 Real: UP=$${upBook.price.toFixed(3)} + DOWN=$${downBook.price.toFixed(3)} = $${realCost.toFixed(4)} (${realEdge.toFixed(1)}%)`);
     if (realCost >= 0.99) {
-        console.log(`   ❌ Arb gone at real prices (${realEdge.toFixed(2)}%)`);
+        console.log(`   ❌ Arb gone (${realEdge.toFixed(2)}%)`);
         trade.error = 'Arb disappeared';
         trade.can_retry = true;
         executedTrades.push(trade);
@@ -290,7 +295,7 @@ export async function executeTrade(arb) {
     }
     // STEP 2: PLACE ORDERS AT EXACT ASK PRICES
     const totalCost = (upBook.price + downBook.price) * MIN_SHARES;
-    console.log(`\n   ⚡ PLACING ORDERS: ${MIN_SHARES} shares @ $${totalCost.toFixed(2)} total`);
+    console.log(`\n   ⚡ PLACING: ${MIN_SHARES} each @ $${totalCost.toFixed(2)} total`);
     const [upOrderId, downOrderId] = await Promise.all([
         placeLimitBuy(arb.up_token_id, MIN_SHARES, upBook.price, 'UP'),
         placeLimitBuy(arb.down_token_id, MIN_SHARES, downBook.price, 'DOWN')
@@ -303,21 +308,18 @@ export async function executeTrade(arb) {
         executedTrades.push(trade);
         return trade;
     }
-    console.log(`   ✓ Orders placed, polling for fills...`);
+    console.log(`   ✓ Orders placed, polling...`);
     // STEP 3: FAST POLLING FOR FILLS
     const fillResult = await waitForBothPositions(arb.up_token_id, arb.down_token_id, MIN_SHARES);
-    // Cancel any unfilled orders
     await cancelAllOrders();
-    // Brief settlement wait
     await new Promise(r => setTimeout(r, SETTLE_WAIT_MS));
     const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     const totalTime = Date.now() - startTime;
     console.log(`\n   📊 RESULT: ${finalPos.up} UP, ${finalPos.down} DOWN (${totalTime}ms)`);
-    // EVALUATE
     // SUCCESS
     if (finalPos.up === finalPos.down && finalPos.up >= MIN_SHARES) {
         const actualCost = (upBook.price + downBook.price) * finalPos.up;
-        console.log(`   ✅✅ SUCCESS! ${finalPos.up} each @ $${actualCost.toFixed(2)} (edge: ${realEdge.toFixed(2)}%)`);
+        console.log(`   ✅✅ SUCCESS! ${finalPos.up} each @ $${actualCost.toFixed(2)} (${realEdge.toFixed(1)}% edge)`);
         completedMarkets.add(arb.market_id);
         trade.status = 'filled';
         trade.shares = finalPos.up;
@@ -334,7 +336,7 @@ export async function executeTrade(arb) {
         executedTrades.push(trade);
         return trade;
     }
-    // IMBALANCED - try to balance
+    // IMBALANCED
     console.log(`   ⚖️ Imbalanced, balancing...`);
     const minPos = Math.min(finalPos.up, finalPos.down);
     if (minPos > 0) {
@@ -388,7 +390,7 @@ export function getExecutionStats() {
         successful_trades: filled.length,
         failed_trades: executedTrades.length - filled.length,
         total_cost: totalCost,
-        total_profit: totalShares - totalCost, // $1 payout per share pair
+        total_profit: totalShares - totalCost,
         pending_payout: totalShares,
     };
 }
@@ -397,5 +399,8 @@ export function isTraderReady() {
 }
 export async function getBalance() {
     return cachedBalance;
+}
+export function shutdownTrader() {
+    disconnectOrderBookWebSocket();
 }
 //# sourceMappingURL=trader.js.map
