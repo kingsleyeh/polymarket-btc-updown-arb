@@ -30,6 +30,7 @@ export declare function addMarket(market: CategorizedMarket): Promise<void>;
 export declare function removeExpiredMarkets(): void;
 export declare function runMarketMakerLoop(): Promise<void>;
 export declare function getActiveMarkets(): Map<string, MarketState>;
+export declare function refreshMarketPositions(): Promise<void>;
 export declare function isAnyMarketHolding(): boolean;
 export declare function printStats(): void;
 export declare function stopMarketMaker(): void;

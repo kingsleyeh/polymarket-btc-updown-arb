@@ -8,7 +8,7 @@
  * Run with: npm run mm
  */
 import * as dotenv from 'dotenv';
-import { initializeMarketMaker, addMarket, removeExpiredMarkets, runMarketMakerLoop, getActiveMarkets, stopMarketMaker, printStats } from './execution/market-maker';
+import { initializeMarketMaker, addMarket, removeExpiredMarkets, runMarketMakerLoop, getActiveMarkets, refreshMarketPositions, stopMarketMaker, printStats } from './execution/market-maker';
 import { scanMarketsWithStrategy } from './crypto/scanner';
 import { connectOrderBookWebSocket, disconnectOrderBookWebSocket } from './execution/orderbook-ws';
 dotenv.config();
@@ -89,6 +89,8 @@ async function main() {
         console.log(`\n[${new Date().toISOString()}] Scanning for markets...`);
         await scanAndAddMarkets();
         removeExpiredMarkets();
+        // Refresh positions before logging
+        await refreshMarketPositions();
         // Log active markets
         const active = getActiveMarkets();
         if (active.size > 0) {

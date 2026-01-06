@@ -158,8 +158,17 @@ async function placeLimitBuy(tokenId: string, shares: number, price: number): Pr
   }
 }
 
-async function marketSell(tokenId: string, shares: number): Promise<boolean> {
-  if (!clobClient || shares <= 0) return true;
+async function marketSell(tokenId: string, shares: number): Promise<{ success: boolean; error?: string }> {
+  if (!clobClient || shares <= 0) return { success: true };
+  
+  // Check actual position before trying to sell
+  const actualPos = await getPosition(tokenId);
+  if (actualPos === 0) {
+    return { success: true, error: 'No position to sell' };
+  }
+  
+  // Use actual position, not requested shares
+  const sharesToSell = Math.min(actualPos, shares);
   
   const bid = getBestBid(tokenId);
   const sellPrice = bid ? Math.max(0.01, bid.price - 0.01) : 0.01;
@@ -168,14 +177,21 @@ async function marketSell(tokenId: string, shares: number): Promise<boolean> {
     const order = await clobClient.createOrder({
       tokenID: tokenId,
       price: sellPrice,
-      size: shares,
+      size: sharesToSell,
       side: Side.SELL,
     });
     
     const result = await clobClient.postOrder(order, OrderType.GTC);
-    return !!result?.orderID;
-  } catch {
-    return false;
+    return { success: !!result?.orderID };
+  } catch (error: any) {
+    const errorMsg = error?.response?.data?.error || error?.message || 'Unknown error';
+    
+    // "not enough balance / allowance" means we don't have the tokens
+    if (errorMsg.includes('not enough balance') || errorMsg.includes('allowance')) {
+      return { success: true, error: 'No balance - position already closed' };
+    }
+    
+    return { success: false, error: errorMsg };
   }
 }
 
@@ -281,28 +297,41 @@ async function cutLoss(state: MarketState, side: 'UP' | 'DOWN', shares: number):
   await new Promise(r => setTimeout(r, 1000));
   
   const currentPos = await getPosition(tokenId);
+  console.log(`   [${state.strategy}] 📊 Actual position: ${currentPos} ${side}`);
+  
   if (currentPos === 0) {
-    console.log(`   [${state.strategy}] ✅ Position already closed`);
+    console.log(`   [${state.strategy}] ✅ Position already closed (no balance)`);
     stats.cutLosses++;
     state.status = 'IDLE';
     return;
   }
   
   for (let attempt = 1; attempt <= CONFIG.CUT_LOSS_MAX_ATTEMPTS; attempt++) {
-    const success = await marketSell(tokenId, currentPos);
+    const result = await marketSell(tokenId, currentPos);
     
-    if (success) {
+    if (result.error && result.error.includes('already closed')) {
+      console.log(`   [${state.strategy}] ✅ Position already closed`);
+      stats.cutLosses++;
+      state.status = 'IDLE';
+      return;
+    }
+    
+    if (result.success) {
       await new Promise(r => setTimeout(r, 2000));
       await cancelAllOrders();
       
       const remaining = await getPosition(tokenId);
+      console.log(`   [${state.strategy}] 📊 Position after sell: ${remaining} ${side}`);
+      
       if (remaining === 0) {
-        console.log(`   [${state.strategy}] ✅ Loss cut`);
+        console.log(`   [${state.strategy}] ✅ Loss cut successfully`);
         stats.cutLosses++;
         stats.totalLoss += currentPos * 0.03; // Estimate 3% loss
         state.status = 'IDLE';
         return;
       }
+    } else {
+      console.log(`   [${state.strategy}] ⚠️ Sell attempt ${attempt} failed: ${result.error || 'Unknown error'}`);
     }
     
     if (attempt < CONFIG.CUT_LOSS_MAX_ATTEMPTS) {
@@ -310,8 +339,17 @@ async function cutLoss(state: MarketState, side: 'UP' | 'DOWN', shares: number):
     }
   }
   
-  console.log(`   [${state.strategy}] ⚠️ Failed to fully close position`);
-  state.status = 'IDLE';
+  // Final check - maybe position was sold by someone else
+  const finalPos = await getPosition(tokenId);
+  if (finalPos === 0) {
+    console.log(`   [${state.strategy}] ✅ Position closed (final check)`);
+    stats.cutLosses++;
+    state.status = 'IDLE';
+    return;
+  }
+  
+  console.log(`   [${state.strategy}] ⚠️ Failed to close position - ${finalPos} ${side} remaining`);
+  state.status = 'IDLE'; // Don't block, but mark as IDLE so we can try again
 }
 
 async function processMarket(state: MarketState): Promise<void> {
@@ -337,45 +375,49 @@ async function processMarket(state: MarketState): Promise<void> {
     return;
   }
   
-  // Get prices
+  // ALWAYS check positions first - don't place new quotes if we have unresolved positions
+  const upPos = await getPosition(state.upTokenId);
+  const downPos = await getPosition(state.downTokenId);
+  
+  // Update state positions for logging
+  state.upPosition = upPos;
+  state.downPosition = downPos;
+  
+  // Both filled
+  if (upPos >= CONFIG.SHARES_PER_ORDER && downPos >= CONFIG.SHARES_PER_ORDER) {
+    const profit = (1 - (state.upBidPrice + state.downBidPrice)) * Math.min(upPos, downPos);
+    console.log(`   [${state.strategy}] ✅✅ BOTH FILLED! ${upPos} UP + ${downPos} DOWN`);
+    console.log(`   [${state.strategy}] 💰 Profit: $${profit.toFixed(2)}`);
+    
+    await cancelAllOrders();
+    stats.bothSideFills++;
+    stats.totalProfit += profit;
+    state.status = 'HOLDING';
+    return;
+  }
+  
+  // One-sided fill - handle immediately, don't place new quotes
+  if (upPos > 0 && downPos === 0) {
+    console.log(`   [${state.strategy}] ⚠️ One-sided UP position detected: ${upPos} UP, 0 DOWN`);
+    stats.oneSidedFills++;
+    const upAsk = getBestAsk(state.upTokenId);
+    await handleOneSidedFill(state, 'UP', state.upBidPrice || (upAsk?.price || 0.5), upPos);
+    return;
+  }
+  
+  if (downPos > 0 && upPos === 0) {
+    console.log(`   [${state.strategy}] ⚠️ One-sided DOWN position detected: 0 UP, ${downPos} DOWN`);
+    stats.oneSidedFills++;
+    const downAsk = getBestAsk(state.downTokenId);
+    await handleOneSidedFill(state, 'DOWN', state.downBidPrice || (downAsk?.price || 0.5), downPos);
+    return;
+  }
+  
+  // Get prices for new quotes (only if no positions)
   const upAsk = getBestAsk(state.upTokenId);
   const downAsk = getBestAsk(state.downTokenId);
   
   if (!upAsk || !downAsk) return;
-  
-  // Check for existing positions that need handling
-  if (state.status === 'QUOTING' || state.status === 'IDLE') {
-    const upPos = await getPosition(state.upTokenId);
-    const downPos = await getPosition(state.downTokenId);
-    
-    // Both filled
-    if (upPos >= CONFIG.SHARES_PER_ORDER && downPos >= CONFIG.SHARES_PER_ORDER) {
-      const profit = (1 - (state.upBidPrice + state.downBidPrice)) * Math.min(upPos, downPos);
-      console.log(`   [${state.strategy}] ✅✅ BOTH FILLED! ${upPos} UP + ${downPos} DOWN`);
-      console.log(`   [${state.strategy}] 💰 Profit: $${profit.toFixed(2)}`);
-      
-      await cancelAllOrders();
-      stats.bothSideFills++;
-      stats.totalProfit += profit;
-      state.status = 'HOLDING';
-      state.upPosition = upPos;
-      state.downPosition = downPos;
-      return;
-    }
-    
-    // One-sided fill
-    if (upPos > 0 && downPos === 0) {
-      stats.oneSidedFills++;
-      await handleOneSidedFill(state, 'UP', state.upBidPrice || upAsk.price, upPos);
-      return;
-    }
-    
-    if (downPos > 0 && upPos === 0) {
-      stats.oneSidedFills++;
-      await handleOneSidedFill(state, 'DOWN', state.downBidPrice || downAsk.price, downPos);
-      return;
-    }
-  }
   
   // Stop taking new quotes <5 min before expiry
   if (timeToExpiry <= CONFIG.STOP_QUOTING_BEFORE_EXPIRY_MS) {
@@ -522,6 +564,15 @@ export async function runMarketMakerLoop(): Promise<void> {
 
 export function getActiveMarkets(): Map<string, MarketState> {
   return marketStates;
+}
+
+export async function refreshMarketPositions(): Promise<void> {
+  for (const state of marketStates.values()) {
+    const upPos = await getPosition(state.upTokenId);
+    const downPos = await getPosition(state.downTokenId);
+    state.upPosition = upPos;
+    state.downPosition = downPos;
+  }
 }
 
 export function isAnyMarketHolding(): boolean {

@@ -15,6 +15,7 @@ import {
   removeExpiredMarkets,
   runMarketMakerLoop,
   getActiveMarkets,
+  refreshMarketPositions,
   stopMarketMaker,
   printStats
 } from './execution/market-maker';
@@ -113,6 +114,9 @@ async function main(): Promise<void> {
     console.log(`\n[${new Date().toISOString()}] Scanning for markets...`);
     await scanAndAddMarkets();
     removeExpiredMarkets();
+    
+    // Refresh positions before logging
+    await refreshMarketPositions();
     
     // Log active markets
     const active = getActiveMarkets();
