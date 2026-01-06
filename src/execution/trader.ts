@@ -125,42 +125,75 @@ async function cancelOrder(orderId: string): Promise<void> {
   try { await clobClient.cancelOrder({ orderID: orderId }); } catch {}
 }
 
-async function marketSell(tokenId: string, shares: number): Promise<boolean> {
+async function marketSell(tokenId: string, shares: number, label: string): Promise<boolean> {
   if (!clobClient || shares <= 0) return true;
   
+  console.log(`   📤 SELLING ${shares} ${label} (waiting for settlement)...`);
   await new Promise(r => setTimeout(r, SETTLEMENT_WAIT_MS));
   
   try {
+    console.log(`   📤 Placing SELL order for ${shares} ${label} @ $0.01...`);
     const result = await clobClient.createAndPostOrder({
       tokenID: tokenId,
       price: 0.01,
       size: shares,
-      side: Side.SELL,
+      side: Side.SELL,  // SELL not BUY!
     }).catch(e => ({ error: e }));
 
     if (result && !('error' in result)) {
-      await new Promise(r => setTimeout(r, 1000));
-      return (await getPosition(tokenId)) === 0;
+      const orderId = (result as any).orderID;
+      console.log(`   ✓ Sell order placed: ${orderId}`);
+      await new Promise(r => setTimeout(r, 1500));
+      const remaining = await getPosition(tokenId);
+      console.log(`   📊 ${label} remaining: ${remaining}`);
+      return remaining === 0;
+    } else {
+      const err = (result as any)?.error;
+      console.log(`   ❌ Sell failed: ${err?.data?.error || err?.message || 'Unknown'}`);
+      return false;
     }
-    return false;
-  } catch {
+  } catch (e: any) {
+    console.log(`   ❌ Sell error: ${e.message}`);
     return false;
   }
 }
 
 async function reverseToZero(upTokenId: string, downTokenId: string): Promise<boolean> {
-  const pos = await getBothPositions(upTokenId, downTokenId);
-  console.log(`   🔄 Reversing ${pos.up} UP, ${pos.down} DOWN...`);
+  // First cancel any open orders that might fill while we're reversing
+  await cancelAllOrders();
   
-  const results = await Promise.all([
-    pos.up > 0 ? marketSell(upTokenId, pos.up) : true,
-    pos.down > 0 ? marketSell(downTokenId, pos.down) : true
-  ]);
+  const pos = await getBothPositions(upTokenId, downTokenId);
+  console.log(`   🔄 Need to sell: ${pos.up} UP, ${pos.down} DOWN`);
+  
+  // Sell sequentially to avoid confusion
+  if (pos.up > 0) {
+    await marketSell(upTokenId, pos.up, 'UP');
+  }
+  if (pos.down > 0) {
+    await marketSell(downTokenId, pos.down, 'DOWN');
+  }
+  
+  // Cancel again in case anything snuck through
+  await cancelAllOrders();
   
   const final = await getBothPositions(upTokenId, downTokenId);
   const success = final.up === 0 && final.down === 0;
-  console.log(success ? `   ✅ Reversed to 0` : `   ❌ Failed: ${final.up} UP, ${final.down} DOWN`);
+  console.log(success ? `   ✅ Reversed to 0` : `   ❌ Still have: ${final.up} UP, ${final.down} DOWN`);
   return success;
+}
+
+/**
+ * Cancel ALL open orders for a token
+ */
+async function cancelAllOrders(): Promise<void> {
+  if (!clobClient) return;
+  try {
+    const openOrders = await clobClient.getOpenOrders();
+    if (openOrders && openOrders.length > 0) {
+      console.log(`   🧹 Cancelling ${openOrders.length} stale orders...`);
+      await Promise.all(openOrders.map(o => cancelOrder(o.id)));
+    }
+  } catch {}
 }
 
 /**
@@ -169,6 +202,9 @@ async function reverseToZero(upTokenId: string, downTokenId: string): Promise<bo
 export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedTrade | null> {
   if (!clobClient || !wallet) return null;
   if (brokenMarkets.has(arb.market_id) || completedMarkets.has(arb.market_id)) return null;
+
+  // FIRST: Cancel any stale orders from previous attempts
+  await cancelAllOrders();
 
   const startTime = Date.now();
   
