@@ -357,6 +357,9 @@ async function hasOpenOrders() {
 async function updateQuotes() {
     if (!state || !clobClient)
         return;
+    // Don't place new quotes if we're holding a completed position
+    if (state.status === 'HOLDING')
+        return;
     // Don't place new quotes if we're in the middle of aggressive complete
     if (state.status === 'AGGRESSIVE_COMPLETE')
         return;
@@ -533,13 +536,36 @@ export async function startMarketMaker(marketId, upTokenId, downTokenId, marketQ
     while (state.status !== 'BLOCKED') {
         try {
             if (state.status === 'COMPLETE') {
-                // Reset for next trade
-                console.log(`\n   🔄 Resetting for next trade...`);
-                state.status = 'IDLE';
-                state.upPosition = 0;
-                state.downPosition = 0;
+                // Trade complete - STOP trading and hold until expiry
+                const upPos = await getPosition(state.upTokenId);
+                const downPos = await getPosition(state.downTokenId);
+                console.log(`\n   ✅✅ TRADE COMPLETE - HOLDING POSITION`);
+                console.log(`   📊 Holding: ${upPos} UP + ${downPos} DOWN`);
+                console.log(`   💰 Waiting for market expiry to collect $${(upPos + downPos).toFixed(2)}`);
+                // Cancel any remaining orders
+                await cancelAllOrders();
+                // Set to HOLDING - no more trading
+                state.status = 'HOLDING';
+                state.upPosition = upPos;
+                state.downPosition = downPos;
                 state.aggressiveCompleteOrderId = null;
-                await new Promise(r => setTimeout(r, 2000));
+            }
+            // If holding, just wait - NO MORE TRADING
+            if (state.status === 'HOLDING') {
+                // Check positions periodically to confirm still holding
+                const upPos = await getPosition(state.upTokenId);
+                const downPos = await getPosition(state.downTokenId);
+                if (upPos > 0 && downPos > 0) {
+                    // Still holding - just wait
+                    await new Promise(r => setTimeout(r, 10000)); // Check every 10 seconds
+                    continue;
+                }
+                else {
+                    // Position changed somehow - log and continue holding
+                    console.log(`   ⚠️  Position changed: ${upPos} UP, ${downPos} DOWN`);
+                    await new Promise(r => setTimeout(r, 10000));
+                    continue;
+                }
             }
             // Handle one-sided states (should be handled by handleOneSidedFill, but check anyway)
             if (state.status === 'ONE_SIDED_UP' || state.status === 'ONE_SIDED_DOWN') {
