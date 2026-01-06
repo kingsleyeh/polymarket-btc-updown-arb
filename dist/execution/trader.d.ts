@@ -26,6 +26,9 @@ interface ExecutedTrade {
     expiry_timestamp: number;
     status: 'pending' | 'filled' | 'partial' | 'failed';
     error?: string;
+    orders_placed: boolean;
+    reversal_succeeded: boolean;
+    has_exposure: boolean;
 }
 /**
  * Initialize the CLOB client with wallet

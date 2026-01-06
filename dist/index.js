@@ -164,22 +164,41 @@ class BTCUpDownArbBot {
                     this.tradingMarkets.add(market.id);
                     // EXECUTE REAL TRADE
                     const trade = await executeTrade(arb);
-                    // CRITICAL: Mark as executed if ANY orders were placed
-                    // This prevents accumulating one-sided positions from retries
+                    // SMART RETRY LOGIC:
+                    // - Success → block market (done)
+                    // - Failed but reversed successfully → allow retry
+                    // - Failed and reversal failed (has exposure) → block market (dangerous)
+                    // - Orders not placed → allow retry
                     if (trade) {
                         if (trade.status === 'filled') {
+                            // SUCCESS - block this market
                             this.executedMarkets.add(market.id);
                             log(`✅ Trade SUCCESS - Both legs filled!`);
                         }
-                        else if (trade.up_order_id || trade.down_order_id) {
-                            // ORDERS WERE PLACED - mark as executed to prevent accumulation!
+                        else if (trade.has_exposure) {
+                            // DANGER: We have unhedged exposure - block market and alert
                             this.executedMarkets.add(market.id);
-                            log(`⚠️ Trade ${trade.status}: ${trade.error || 'Incomplete'}`);
-                            log(`   ⛔ Market blocked - NO MORE RETRIES (orders were placed)`);
+                            log(`🚨 DANGER: Unhedged exposure! ${trade.error}`);
+                            log(`   ⛔ Market BLOCKED - Manual intervention required`);
                         }
-                        else {
+                        else if (trade.orders_placed && !trade.reversal_succeeded && !trade.has_exposure) {
+                            // Orders placed, no positions remain (orders cancelled or never filled)
+                            // This is safe - allow retry
+                            log(`⚠️ Trade failed but no exposure - Can retry`);
+                        }
+                        else if (trade.orders_placed && trade.reversal_succeeded) {
+                            // Orders placed, one side filled, but successfully reversed
+                            // This is safe - allow retry
+                            log(`⚠️ Trade failed, position reversed - Can retry`);
+                        }
+                        else if (!trade.orders_placed) {
                             // Orders were NOT placed - can retry
                             log(`⚠️ Orders not placed - Can retry if arb persists`);
+                        }
+                        else {
+                            // Unknown state - be safe, block
+                            this.executedMarkets.add(market.id);
+                            log(`⚠️ Unknown trade state - Market blocked for safety`);
                         }
                     }
                     else {

@@ -57,6 +57,10 @@ interface ExecutedTrade {
   expiry_timestamp: number;
   status: 'pending' | 'filled' | 'partial' | 'failed';
   error?: string;
+  // Smart retry fields
+  orders_placed: boolean; // True if any orders were submitted to the exchange
+  reversal_succeeded: boolean; // True if one-sided position was successfully reversed
+  has_exposure: boolean; // True if we have unhedged position (needs manual intervention)
 }
 
 const executedTrades: ExecutedTrade[] = [];
@@ -618,24 +622,35 @@ async function waitForBothOrders(
     secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
   ]);
 
-  // Reverse any filled leg - use actual balance from positions
+  // Reverse any filled leg - use ACTUAL balance from positions (not expected shares)
   let reversed = false;
+  let hadPositionToReverse = false;
+  
   if (finalHasUp && !finalHasDown) {
-    const sharesToReverse = Math.max(Math.floor(finalPositions.upBalance), shares);
-    console.log(`   🔄 Reversing ${sharesToReverse} UP shares...`);
-    reversed = await reversePosition(upTokenId, sharesToReverse);
+    hadPositionToReverse = true;
+    // Only reverse what we actually have, not what we expected
+    const sharesToReverse = Math.floor(finalPositions.upBalance);
+    if (sharesToReverse >= 1) {
+      console.log(`   🔄 Reversing ${sharesToReverse} UP shares...`);
+      reversed = await reversePosition(upTokenId, sharesToReverse);
+    }
   } else if (!finalHasUp && finalHasDown) {
-    const sharesToReverse = Math.max(Math.floor(finalPositions.downBalance), shares);
-    console.log(`   🔄 Reversing ${sharesToReverse} DOWN shares...`);
-    reversed = await reversePosition(downTokenId, sharesToReverse);
-  } else {
-    console.log(`   ℹ️ No positions to reverse - orders didn't fill`);
+    hadPositionToReverse = true;
+    const sharesToReverse = Math.floor(finalPositions.downBalance);
+    if (sharesToReverse >= 1) {
+      console.log(`   🔄 Reversing ${sharesToReverse} DOWN shares...`);
+      reversed = await reversePosition(downTokenId, sharesToReverse);
+    }
+  } else if (!finalHasUp && !finalHasDown) {
+    // No positions - orders never filled, this is actually a success (no exposure)
+    console.log(`   ✓ No positions to reverse - orders didn't fill (safe)`);
+    reversed = true; // Mark as "reversed" since we have no exposure
   }
   
-  if (reversed) {
-    console.log(`   ✅ Reversal successful`);
-  } else if (finalHasUp || finalHasDown) {
-    console.log(`   ⚠️ Reversal may have failed - check manually`);
+  if (reversed && hadPositionToReverse) {
+    console.log(`   ✅ Reversal successful - position cleared`);
+  } else if (!reversed && hadPositionToReverse) {
+    console.log(`   ❌ REVERSAL FAILED - MANUAL INTERVENTION NEEDED`);
   }
 
   return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
@@ -703,6 +718,9 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     timestamp: now,
     expiry_timestamp: arb.expiry_timestamp,
     status: 'pending',
+    orders_placed: false,
+    reversal_succeeded: false,
+    has_exposure: false,
   };
 
   console.log(`   Shares: ${shares} @ $${combinedCost.toFixed(4)}`);
@@ -735,18 +753,18 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
   console.log(`   Market orders: UP=$${upMarketPrice.toFixed(3)} DOWN=$${downMarketPrice.toFixed(3)} = $${maxCombinedCost.toFixed(4)}`);
 
   try {
-    // Place BOTH orders simultaneously with TRUE MARKET prices (20% buffer)
-    console.log(`   🚀 Placing BOTH market orders simultaneously...`);
+    // Place BOTH orders simultaneously with aggressive limit prices
+    console.log(`   🚀 Placing BOTH orders simultaneously...`);
     const [upResult, downResult] = await Promise.all([
       clobClient.createAndPostOrder({
         tokenID: arb.up_token_id,
-        price: upMarketPrice, // TRUE MARKET ORDER - 20% above current price
+        price: upMarketPrice, // Aggressive limit to ensure fill
         size: shares,
         side: Side.BUY,
       }).catch(err => ({ error: err })),
       clobClient.createAndPostOrder({
         tokenID: arb.down_token_id,
-        price: downMarketPrice, // TRUE MARKET ORDER - 20% above current price
+        price: downMarketPrice, // Aggressive limit to ensure fill
         size: shares,
         side: Side.BUY,
       }).catch(err => ({ error: err })),
@@ -787,6 +805,7 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
       }
       
       trade.status = 'failed';
+      trade.orders_placed = false; // Orders were NOT placed - safe to retry
       trade.error = `Order submission failed: UP=${upOrderId ? 'ok' : upErr}, DOWN=${downOrderId ? 'ok' : downErr}`;
       console.log(`   ❌ TRADE FAILED - Could not submit both orders`);
       executedTrades.push(trade);
@@ -795,12 +814,13 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
 
     trade.up_order_id = upOrderId;
     trade.down_order_id = downOrderId;
+    trade.orders_placed = true; // CRITICAL: Orders are now live on the exchange
     console.log(`   ✓ UP order submitted: ${upOrderId}`);
     console.log(`   ✓ DOWN order submitted: ${downOrderId}`);
     console.log(`   ⏳ Waiting for both orders to fill (max ${ORDER_FILL_TIMEOUT_MS / 1000}s)...`);
 
     // Wait for both orders to fill, place market order for second leg if one fills
-    const { upFilled, downFilled, secondLegOrderId, reversed } = await waitForBothOrders(
+    const { upFilled, downFilled, secondLegOrderId, reversed: waitReversed } = await waitForBothOrders(
       upOrderId,
       downOrderId,
       arb.up_token_id,
@@ -809,71 +829,93 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
       upMarketPrice,
       downMarketPrice
     );
-
-    // Final position check (waitForBothOrders already checked, but double-check)
-    const finalCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
     
     // Update order IDs if we placed a market order for second leg
     if (secondLegOrderId) {
       trade.down_order_id = secondLegOrderId;
     }
 
-    // FINAL SAFETY CHECK: Always verify and reverse one-sided positions
-    // This is a last-ditch effort to prevent exposure
-    const safetyCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
-    const hasOneSided = (safetyCheck.hasUp && !safetyCheck.hasDown) || (!safetyCheck.hasUp && safetyCheck.hasDown);
+    // Final position check - this is the source of truth
+    const finalCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
+    const hasBoth = finalCheck.hasUp && finalCheck.hasDown;
+    const hasOneSided = (finalCheck.hasUp && !finalCheck.hasDown) || (!finalCheck.hasUp && finalCheck.hasDown);
+    const hasNone = !finalCheck.hasUp && !finalCheck.hasDown;
     
-    if (hasOneSided) {
-      console.log(`   🚨 SAFETY CHECK: One-sided position detected! UP=${safetyCheck.upBalance.toFixed(1)} DOWN=${safetyCheck.downBalance.toFixed(1)}`);
-      console.log(`   🔄 FORCING REVERSAL...`);
-      
-      let safetyReversed = false;
-      if (safetyCheck.hasUp && !safetyCheck.hasDown) {
-        safetyReversed = await reversePosition(arb.up_token_id, Math.floor(safetyCheck.upBalance));
-        if (safetyReversed) {
-          console.log(`   ✅ UP position reversed (safety check)`);
-        } else {
-          console.log(`   ❌ FAILED to reverse UP position - MANUAL INTERVENTION NEEDED!`);
-        }
-      } else if (!safetyCheck.hasUp && safetyCheck.hasDown) {
-        safetyReversed = await reversePosition(arb.down_token_id, Math.floor(safetyCheck.downBalance));
-        if (safetyReversed) {
-          console.log(`   ✅ DOWN position reversed (safety check)`);
-        } else {
-          console.log(`   ❌ FAILED to reverse DOWN position - MANUAL INTERVENTION NEEDED!`);
-        }
-      }
-      
-      trade.status = 'failed';
-      trade.error = `One-sided position detected and ${safetyReversed ? 'reversed' : 'reversal failed'}`;
-      console.log(`   📊 Continuing to scan for more opportunities...\n`);
-      executedTrades.push(trade);
-      return trade;
-    }
-
-    // BOTH OR NOTHING: Only success if we have both positions
-    if (upFilled && downFilled && finalCheck.hasUp && finalCheck.hasDown) {
+    // SUCCESS: Both positions confirmed
+    if (hasBoth) {
       trade.status = 'filled';
+      trade.has_exposure = false;
+      trade.reversal_succeeded = false; // N/A
       console.log(`   ✅ BOTH POSITIONS CONFIRMED - Profit locked: $${profitUsd.toFixed(2)}`);
       cachedBalance -= costUsd;
       console.log(`   💵 Remaining balance: ~$${cachedBalance.toFixed(2)}`);
-      console.log(`   📊 Continuing to scan for more opportunities...\n`);
-    } else {
-      // Don't have both - trade failed
+      console.log(`   📊 Continuing to scan...\n`);
+      executedTrades.push(trade);
+      return trade;
+    }
+    
+    // DANGER: One-sided position - need to verify reversal worked
+    if (hasOneSided) {
+      console.log(`   🚨 One-sided position: UP=${finalCheck.upBalance.toFixed(1)} DOWN=${finalCheck.downBalance.toFixed(1)}`);
+      
+      // waitForBothOrders should have already tried to reverse
+      // But we still have a position, so reversal failed OR it's still pending
+      // Try ONE more time
+      console.log(`   🔄 Attempting final reversal...`);
+      let finalReversed = false;
+      
+      if (finalCheck.hasUp && !finalCheck.hasDown) {
+        finalReversed = await reversePosition(arb.up_token_id, Math.floor(finalCheck.upBalance));
+      } else {
+        finalReversed = await reversePosition(arb.down_token_id, Math.floor(finalCheck.downBalance));
+      }
+      
+      // Check positions again after reversal attempt
+      const afterReversal = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
+      const stillHasExposure = (afterReversal.hasUp && !afterReversal.hasDown) || (!afterReversal.hasUp && afterReversal.hasDown);
+      
       trade.status = 'failed';
-      const posInfo = `UP=${finalCheck.upBalance.toFixed(1)} DOWN=${finalCheck.downBalance.toFixed(1)}`;
-      trade.error = 'Could not complete both legs';
-      console.log(`   ❌ Trade failed - ${posInfo}`);
-      console.log(`   📊 Continuing to scan for more opportunities...\n`);
+      trade.reversal_succeeded = finalReversed && !stillHasExposure;
+      trade.has_exposure = stillHasExposure;
+      
+      if (stillHasExposure) {
+        trade.error = 'REVERSAL FAILED - Manual intervention needed';
+        console.log(`   ❌ REVERSAL FAILED - Unhedged: UP=${afterReversal.upBalance.toFixed(1)} DOWN=${afterReversal.downBalance.toFixed(1)}`);
+        console.log(`   🚨 MANUAL INTERVENTION NEEDED!`);
+      } else {
+        trade.error = 'One-sided position reversed successfully';
+        console.log(`   ✅ Position cleared - can retry if arb persists`);
+      }
+      console.log(`   📊 Continuing to scan...\n`);
+      executedTrades.push(trade);
+      return trade;
+    }
+    
+    // NO POSITIONS: Orders never filled (or were cancelled)
+    if (hasNone) {
+      trade.status = 'failed';
+      trade.error = 'Orders did not fill';
+      trade.reversal_succeeded = true; // No exposure = success
+      trade.has_exposure = false;
+      console.log(`   ℹ️ No positions - orders didn't fill (can retry)`);
+      console.log(`   📊 Continuing to scan...\n`);
+      executedTrades.push(trade);
+      return trade;
     }
 
   } catch (error: any) {
     trade.status = 'failed';
     trade.error = error.message;
-    console.error(`   ❌ TRADE FAILED: ${error.message}`);
-    console.log(`   📊 Continuing to scan for more opportunities...\n`);
+    trade.has_exposure = false; // Unknown state, assume safe but log error
+    trade.reversal_succeeded = false;
+    console.error(`   ❌ TRADE ERROR: ${error.message}`);
+    console.log(`   📊 Continuing to scan...\n`);
+    executedTrades.push(trade);
+    return trade;
   }
 
+  // Should not reach here - all cases above should return
+  console.warn(`   ⚠️ Unexpected code path - trade state unknown`);
   executedTrades.push(trade);
   return trade;
 }
