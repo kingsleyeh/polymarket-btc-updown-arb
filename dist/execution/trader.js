@@ -304,44 +304,65 @@ export async function executeTrade(arb) {
         // ========== STEP 4: Wait for UP to fill ==========
         console.log(`   ⏳ Waiting for UP to fill...`);
         const upFilled = await waitForPosition(arb.up_token_id, arb.down_token_id, shares, FILL_TIMEOUT_MS, 'UP');
-        // Final check
+        // Final check - MUST verify EXACT equality
         const finalCheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
-        if (finalCheck.hasUp && finalCheck.hasDown) {
-            // SUCCESS!
-            console.log(`   ✅✅ BOTH FILLED - ARBITRAGE COMPLETE!`);
-            console.log(`   💰 Locked profit: $${profitUsd.toFixed(2)}`);
+        const upShares = Math.floor(finalCheck.upBalance);
+        const downShares = Math.floor(finalCheck.downBalance);
+        console.log(`   📊 Final positions: UP=${upShares} DOWN=${downShares}`);
+        // SUCCESS: Both filled with EQUAL shares
+        if (upShares > 0 && downShares > 0 && upShares === downShares) {
+            console.log(`   ✅✅ ARBITRAGE COMPLETE! ${upShares} UP = ${downShares} DOWN`);
+            const actualCost = upShares * combinedCost;
+            const actualProfit = upShares * (1.0 - combinedCost);
+            console.log(`   💰 Locked profit: $${actualProfit.toFixed(2)} on ${upShares} shares`);
             trade.status = 'filled';
+            trade.shares = upShares;
             trade.has_exposure = false;
-            cachedBalance -= costUsd;
+            cachedBalance -= actualCost;
             executedTrades.push(trade);
             return trade;
         }
-        if (finalCheck.hasDown && !finalCheck.hasUp) {
-            // Have DOWN but not UP
-            console.log(`   ⚠️ UP didn't fill - cancelling...`);
+        // IMBALANCED: Different number of shares - THIS IS BAD
+        if (upShares !== downShares) {
+            // Try to cancel any pending orders
             await cancelOrder(upOrderId);
-            // Check again
+            // Recheck after cancel
             const recheck = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
-            if (recheck.hasUp && recheck.hasDown) {
-                console.log(`   ✅ UP filled just before cancel - SUCCESS!`);
+            const finalUp = Math.floor(recheck.upBalance);
+            const finalDown = Math.floor(recheck.downBalance);
+            if (finalUp === finalDown && finalUp > 0) {
+                // Cancel caused them to equalize - success!
+                console.log(`   ✅ Equalized after cancel: ${finalUp} UP = ${finalDown} DOWN`);
                 trade.status = 'filled';
+                trade.shares = finalUp;
                 trade.has_exposure = false;
                 executedTrades.push(trade);
                 return trade;
             }
-            console.log(`   🚨 EXPOSURE: Have ${recheck.downBalance.toFixed(0)} DOWN, ${recheck.upBalance.toFixed(0)} UP`);
-            console.log(`   👉 MANUAL: Balance positions on polymarket.com`);
+            // Still imbalanced
+            console.log(`   🚨 IMBALANCED: ${finalUp} UP ≠ ${finalDown} DOWN`);
+            console.log(`   ⚠️  This violates the equal shares rule!`);
+            console.log(`   👉 MANUAL: Go to polymarket.com and make UP = DOWN`);
             trade.status = 'failed';
             trade.has_exposure = true;
-            trade.error = `Imbalanced: ${recheck.downBalance.toFixed(0)} DOWN, ${recheck.upBalance.toFixed(0)} UP`;
+            trade.error = `IMBALANCED: ${finalUp} UP ≠ ${finalDown} DOWN - fix on polymarket.com`;
             executedTrades.push(trade);
             return trade;
         }
-        // Unexpected state
-        console.log(`   ⚠️ Unexpected: UP=${finalCheck.upBalance} DOWN=${finalCheck.downBalance}`);
+        // No shares at all
+        if (upShares === 0 && downShares === 0) {
+            console.log(`   ℹ️ No positions - orders didn't fill`);
+            trade.status = 'failed';
+            trade.has_exposure = false;
+            trade.error = 'Orders did not fill';
+            executedTrades.push(trade);
+            return trade;
+        }
+        // Shouldn't reach here
+        console.log(`   ⚠️ Unexpected state`);
         trade.status = 'failed';
-        trade.has_exposure = finalCheck.hasUp || finalCheck.hasDown;
-        trade.error = `Unexpected state`;
+        trade.has_exposure = upShares !== downShares;
+        trade.error = `Unexpected: ${upShares} UP, ${downShares} DOWN`;
         executedTrades.push(trade);
         return trade;
     }

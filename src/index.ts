@@ -227,40 +227,25 @@ class BTCUpDownArbBot {
           // EXECUTE REAL TRADE
           const trade = await executeTrade(arb);
           
-          // SMART RETRY LOGIC:
-          // - Success → block market (done)
-          // - Failed but reversed successfully → allow retry
-          // - Failed and reversal failed (has exposure) → block market (dangerous)
-          // - Orders not placed → allow retry
+          // STRICT RULE: ONE ATTEMPT PER MARKET - NO RETRIES
+          // This ensures we never accumulate imbalanced positions
+          // If anything goes wrong, block the market forever
+          
+          // ALWAYS block market after any trade attempt
+          this.executedMarkets.add(market.id);
+          
           if (trade) {
             if (trade.status === 'filled') {
-              // SUCCESS - block this market
-              this.executedMarkets.add(market.id);
-              log(`✅ Trade SUCCESS - Both legs filled!`);
+              log(`✅ SUCCESS - Both legs filled equally!`);
             } else if (trade.has_exposure) {
-              // DANGER: We have unhedged exposure - block market and alert
-              this.executedMarkets.add(market.id);
-              log(`🚨 DANGER: Unhedged exposure! ${trade.error}`);
-              log(`   ⛔ Market BLOCKED - Manual intervention required`);
-            } else if (trade.orders_placed && !trade.reversal_succeeded && !trade.has_exposure) {
-              // Orders placed, no positions remain (orders cancelled or never filled)
-              // This is safe - allow retry
-              log(`⚠️ Trade failed but no exposure - Can retry`);
-            } else if (trade.orders_placed && trade.reversal_succeeded) {
-              // Orders placed, one side filled, but successfully reversed
-              // This is safe - allow retry
-              log(`⚠️ Trade failed, position reversed - Can retry`);
-            } else if (!trade.orders_placed) {
-              // Orders were NOT placed - can retry
-              log(`⚠️ Orders not placed - Can retry if arb persists`);
+              log(`🚨 EXPOSURE: ${trade.error}`);
+              log(`   👉 Go to polymarket.com and balance your position`);
             } else {
-              // Unknown state - be safe, block
-              this.executedMarkets.add(market.id);
-              log(`⚠️ Unknown trade state - Market blocked for safety`);
+              log(`⚠️ Trade failed: ${trade.error || 'Unknown'}`);
             }
+            log(`   ⛔ Market BLOCKED - No retries allowed`);
           } else {
-            // Trade was null (rejected before execution) - can retry
-            log(`⚠️ Trade rejected before execution - Can retry if arb persists`);
+            log(`⚠️ Trade rejected - Market BLOCKED anyway (one attempt only)`);
           }
           
           // RELEASE LOCKS (done processing this attempt)
