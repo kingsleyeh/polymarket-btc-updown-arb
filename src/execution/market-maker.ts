@@ -463,18 +463,25 @@ async function hasOpenOrders(): Promise<boolean> {
 }
 
 async function updateQuotes(): Promise<void> {
-  if (!state || !clobClient) return;
+  if (!state || !clobClient) {
+    console.log(`   ⚠️ updateQuotes: No state or client`);
+    return;
+  }
   // Don't place new quotes if we're holding a completed position
   if (state.status === 'HOLDING') return;
   // Don't place new quotes if we're in the middle of aggressive complete
   if (state.status === 'AGGRESSIVE_COMPLETE') return;
-  if (state.status !== 'IDLE' && state.status !== 'QUOTING') return;
+  if (state.status !== 'IDLE' && state.status !== 'QUOTING') {
+    console.log(`   ⚠️ updateQuotes: Status is ${state.status}, skipping`);
+    return;
+  }
   
   // Get current market prices from WebSocket cache
   const upAsk = getBestAsk(state.upTokenId);
   const downAsk = getBestAsk(state.downTokenId);
   
   if (!upAsk || !downAsk) {
+    console.log(`   ⚠️ No order book data: UP=${upAsk ? 'yes' : 'NO'}, DOWN=${downAsk ? 'yes' : 'NO'}`);
     return; // No price data yet
   }
   
@@ -486,6 +493,8 @@ async function updateQuotes(): Promise<void> {
       state.status = 'IDLE';
       state.upOrderId = null;
       state.downOrderId = null;
+    } else {
+      console.log(`   ⏸️  Volatility skip: UP=$${upAsk.price.toFixed(2)}, DOWN=$${downAsk.price.toFixed(2)}`);
     }
     return; // Skip - too volatile
   }
@@ -495,6 +504,10 @@ async function updateQuotes(): Promise<void> {
   
   // Calculate bid prices using strategy-specific target
   const prices = calculateBidPrices(upAsk.price, downAsk.price, strategyConfig.TARGET_COMBINED, strategyConfig.MIN_EDGE_TO_QUOTE);
+  
+  if (!prices) {
+    console.log(`   ⚠️ No edge: UP ask=$${upAsk.price.toFixed(3)}, DOWN ask=$${downAsk.price.toFixed(3)} (combined $${(upAsk.price + downAsk.price).toFixed(4)})`);
+  }
   
   if (!prices) {
     // Not enough edge - cancel existing orders
@@ -747,6 +760,40 @@ export async function startMarketMaker(
         // Wait for aggressive complete to resolve (handled in handleOneSidedFill)
         await new Promise(r => setTimeout(r, 1000));
         continue;
+      }
+      
+      // Check if market expired
+      const now = Date.now();
+      const timeToExpiry = state.expiryTimestamp - now;
+      
+      if (timeToExpiry <= 60000) { // Less than 1 minute to expiry
+        console.log(`\n   ⏰ Market expiring in ${Math.round(timeToExpiry / 1000)}s`);
+        
+        // If we have a position, keep holding
+        const upPos = await getPosition(state.upTokenId);
+        const downPos = await getPosition(state.downTokenId);
+        
+        if (upPos > 0 && downPos > 0) {
+          console.log(`   📦 Holding ${upPos} UP + ${downPos} DOWN until expiry`);
+          state.status = 'HOLDING';
+          continue;
+        }
+        
+        // No position - exit this market
+        if (upPos === 0 && downPos === 0) {
+          console.log(`   📤 No position - exiting market`);
+          await cancelAllOrders();
+          state.status = 'BLOCKED';
+          break;
+        }
+        
+        // One-sided position - try to close
+        if ((upPos > 0 && downPos === 0) || (downPos > 0 && upPos === 0)) {
+          console.log(`   ⚠️ One-sided position at expiry: ${upPos} UP, ${downPos} DOWN`);
+          // Let it ride - market will settle
+          state.status = 'HOLDING';
+          continue;
+        }
       }
       
       // Update quotes

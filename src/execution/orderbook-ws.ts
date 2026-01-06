@@ -98,7 +98,12 @@ export function connectOrderBookWebSocket(): Promise<boolean> {
  * Handle incoming WebSocket message
  */
 function handleMessage(message: any): void {
-  // Order book update message format
+  // Debug: Log first few messages to understand format
+  if (orderBookCache.size === 0 && message) {
+    console.log(`   📡 WS message type: ${message.event_type || message.type || 'unknown'}`);
+  }
+  
+  // Order book update message format (event_type: 'book')
   if (message.event_type === 'book' && message.asset_id) {
     const tokenId = message.asset_id;
     
@@ -107,6 +112,31 @@ function handleMessage(message: any): void {
       bids: message.bids || [],
       timestamp: Date.now(),
     });
+    return;
+  }
+  
+  // Alternative format: type: 'market' with market array
+  if (message.type === 'market' && Array.isArray(message.market)) {
+    for (const m of message.market) {
+      if (m.asset_id && (m.asks || m.bids)) {
+        orderBookCache.set(m.asset_id, {
+          asks: m.asks || [],
+          bids: m.bids || [],
+          timestamp: Date.now(),
+        });
+      }
+    }
+    return;
+  }
+  
+  // Another format: direct book data with asset_id
+  if (message.asset_id && (message.asks || message.bids)) {
+    orderBookCache.set(message.asset_id, {
+      asks: message.asks || [],
+      bids: message.bids || [],
+      timestamp: Date.now(),
+    });
+    return;
   }
   
   // Price update can also update our cache

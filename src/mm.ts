@@ -1,9 +1,11 @@
 /**
  * MARKET MAKER ENTRY POINT - Dual Strategy
  * 
- * Continuously monitors two markets:
+ * Runs ONE market at a time:
  *   - LIVE (≤15 min to expiry): 3% edge target
  *   - PREMARKET (15-30 min to expiry): 2% edge target
+ * 
+ * After completing a trade → hold until expiry → scan for next market
  * 
  * Run with: npm run mm
  */
@@ -13,8 +15,6 @@ import {
   initializeMarketMaker, 
   startMarketMakerForMarket, 
   stopMarketMaker,
-  getMarketState,
-  isHolding,
   printStats
 } from './execution/market-maker';
 import { scanMarketsWithStrategy, CategorizedMarket } from './crypto/scanner';
@@ -22,29 +22,34 @@ import { connectOrderBookWebSocket, disconnectOrderBookWebSocket } from './execu
 
 dotenv.config();
 
-// Track active markets
-interface ActiveMarket {
-  market: CategorizedMarket;
-  status: 'WATCHING' | 'TRADING' | 'HOLDING' | 'EXPIRED';
-}
-
-const activeMarkets: Map<string, ActiveMarket> = new Map();
 let isRunning = true;
 
-async function scanAndUpdateMarkets(): Promise<CategorizedMarket[]> {
-  try {
-    const markets = await scanMarketsWithStrategy();
-    return markets;
-  } catch (error: any) {
-    console.log(`   ⚠️ Market scan error: ${error.message}`);
-    return [];
-  }
+function formatTimeToExpiry(sec: number): string {
+  const minutes = Math.floor(sec / 60);
+  const seconds = Math.floor(sec % 60);
+  return `${minutes}m ${seconds}s`;
 }
 
-function formatTimeToExpiry(ms: number): string {
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.floor((ms % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
+async function findBestMarket(): Promise<CategorizedMarket | null> {
+  try {
+    const markets = await scanMarketsWithStrategy();
+    
+    if (markets.length === 0) {
+      return null;
+    }
+    
+    // Prefer LIVE markets (more urgency), then PREMARKET
+    const liveMarket = markets.find(m => m.strategy === 'LIVE');
+    if (liveMarket) return liveMarket;
+    
+    const premarketMarket = markets.find(m => m.strategy === 'PREMARKET');
+    if (premarketMarket) return premarketMarket;
+    
+    return null;
+  } catch (error: any) {
+    console.log(`   ⚠️ Market scan error: ${error.message}`);
+    return null;
+  }
 }
 
 async function main(): Promise<void> {
@@ -56,6 +61,10 @@ async function main(): Promise<void> {
   console.log('   📊 PREMARKET (15-30 min to expiry): Target 2% edge');
   console.log('\nFilters:');
   console.log('   ⚠️ Skip if UP or DOWN >= 80¢ (high volatility)');
+  console.log('\nBehavior:');
+  console.log('   ✅ One market at a time');
+  console.log('   ✅ Hold position until expiry');
+  console.log('   ✅ Then scan for next market');
   console.log('='.repeat(70) + '\n');
 
   // Initialize
@@ -81,107 +90,40 @@ async function main(): Promise<void> {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  console.log('🔍 Starting continuous market scan...\n');
+  console.log('🔍 Starting market scan loop...\n');
 
-  // Main loop - continuously scan and trade
+  // Main loop - find market, trade it, wait for expiry, repeat
   while (isRunning) {
     try {
-      const now = Date.now();
+      // Find a market to trade
+      console.log(`[${new Date().toISOString()}] Scanning for markets...`);
+      const market = await findBestMarket();
       
-      // Scan for markets
-      const markets = await scanAndUpdateMarkets();
-      
-      if (markets.length === 0) {
-        console.log(`[${new Date().toISOString()}] No markets found (waiting for 15-30 min window)`);
-        await new Promise(r => setTimeout(r, 10000)); // Wait 10s before next scan
+      if (!market) {
+        console.log(`   No tradeable markets found. Waiting 30s...`);
+        await new Promise(r => setTimeout(r, 30000));
         continue;
       }
-
-      // Process each market
-      for (const market of markets) {
-        const timeToExpiry = market.expiry_timestamp - now;
-        const marketKey = market.id;
-        
-        // Skip if market expired or too close
-        if (timeToExpiry <= 60000) { // Less than 1 minute
-          activeMarkets.delete(marketKey);
-          continue;
-        }
-
-        // Check if we're already tracking this market
-        const existing = activeMarkets.get(marketKey);
-        
-        if (existing) {
-          // Already tracking - check status
-          if (existing.status === 'HOLDING') {
-            // Still holding, wait for expiry
-            if (timeToExpiry <= 0) {
-              console.log(`   ✅ Market expired - position settled`);
-              activeMarkets.delete(marketKey);
-            }
-            continue;
-          }
-          
-          if (existing.status === 'TRADING') {
-            // Check if trade completed
-            const state = getMarketState();
-            if (state && state.status === 'HOLDING') {
-              existing.status = 'HOLDING';
-              console.log(`   📦 Now holding position in ${market.question.slice(0, 40)}...`);
-            }
-            continue; // Don't start new trade while one is active
-          }
-        }
-
-        // Check if we're already trading any market
-        const state = getMarketState();
-        if (state && (state.status === 'QUOTING' || state.status === 'AGGRESSIVE_COMPLETE' || state.status === 'ONE_SIDED_UP' || state.status === 'ONE_SIDED_DOWN')) {
-          // Already actively trading, don't start another
-          continue;
-        }
-
-        // Check if we're holding a position in any market
-        if (state && state.status === 'HOLDING') {
-          // We're holding - don't trade until expiry
-          continue;
-        }
-
-        // New market or not yet trading - start trading
-        console.log(`\n[${new Date().toISOString()}] Found ${market.strategy} market:`);
-        console.log(`   ${market.question}`);
-        console.log(`   Time to expiry: ${formatTimeToExpiry(timeToExpiry)}`);
-        
-        activeMarkets.set(marketKey, {
-          market,
-          status: 'TRADING',
-        });
-
-        // Start trading this market (non-blocking - runs in background)
-        startMarketMakerForMarket(market).then(() => {
-          const m = activeMarkets.get(marketKey);
-          if (m) {
-            const finalState = getMarketState();
-            if (finalState && finalState.status === 'HOLDING') {
-              m.status = 'HOLDING';
-            } else {
-              m.status = 'EXPIRED';
-            }
-          }
-        }).catch((error) => {
-          console.error(`Error in market maker: ${error.message}`);
-          activeMarkets.delete(marketKey);
-        });
-
-        // Only trade one market at a time
-        break;
-      }
-
-      // Brief pause between scans
+      
+      console.log(`\n[${new Date().toISOString()}] Found ${market.strategy} market:`);
+      console.log(`   ${market.question}`);
+      console.log(`   Time to expiry: ${formatTimeToExpiry(market.timeToExpirySec)}`);
+      console.log(`   UP token: ${market.up_token_id.slice(0, 20)}...`);
+      console.log(`   DOWN token: ${market.down_token_id.slice(0, 20)}...`);
+      
+      // Trade this market (BLOCKING - waits until HOLDING or BLOCKED)
+      await startMarketMakerForMarket(market);
+      
+      // After market maker returns, we're either HOLDING or done
+      console.log(`\n[${new Date().toISOString()}] Market maker finished for ${market.question.slice(0, 40)}...`);
+      
+      // Brief pause before scanning for next market
+      console.log(`   Waiting 5s before scanning for next market...`);
       await new Promise(r => setTimeout(r, 5000));
       
     } catch (error: any) {
       console.error(`Main loop error: ${error.message}`);
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise(r => setTimeout(r, 10000));
     }
   }
 }
