@@ -22,11 +22,12 @@ import {
 // Phase 1 Configuration
 const CONFIG = {
   TARGET_COMBINED: 0.97,        // 3% profit target
-  MAX_COMBINED: 0.99,           // Accept down to 1% profit to complete
+  MAX_COMBINED: 1.005,          // Accept up to 0.5% loss to complete (better than cutting)
   SHARES_PER_ORDER: 5,          // Small size for learning
   REQUOTE_INTERVAL_MS: 2000,    // Update quotes every 2s
   MIN_EDGE_TO_QUOTE: 0.02,      // Only quote if potential 2%+ edge exists
   POSITION_CHECK_INTERVAL_MS: 500,
+  CUT_LOSS_MAX_ATTEMPTS: 3,     // Try selling 3 times before giving up
 };
 
 const CHAIN_ID = 137;
@@ -159,17 +160,22 @@ async function marketBuy(tokenId: string, shares: number, maxPrice: number): Pro
 async function marketSell(tokenId: string, shares: number): Promise<boolean> {
   if (!clobClient || shares <= 0) return true;
   
+  // Get current bid price to sell at market
+  const bid = getBestBid(tokenId);
+  const sellPrice = bid ? Math.max(0.01, bid.price - 0.01) : 0.01; // Slightly below bid to ensure fill
+  
   try {
     const order = await clobClient.createOrder({
       tokenID: tokenId,
-      price: 0.01,
+      price: sellPrice,
       size: shares,
       side: Side.SELL,
     });
     
     const result = await clobClient.postOrder(order, OrderType.GTC);
     return !!result?.orderID;
-  } catch {
+  } catch (error: any) {
+    console.log(`   ⚠️ Sell order failed: ${error.message}`);
     return false;
   }
 }
@@ -230,10 +236,14 @@ async function handleOneSidedFill(filledSide: 'UP' | 'DOWN', filledPrice: number
   console.log(`   📊 ${otherSide} ask: $${otherAsk.price.toFixed(3)}`);
   console.log(`   📊 Would pay combined: $${wouldPayCombined.toFixed(4)}`);
   
-  if (wouldPayCombined < CONFIG.MAX_COMBINED) {
-    // Still profitable - complete the pair
-    const profit = (1 - wouldPayCombined) * 100;
-    console.log(`   ✅ Completing pair (${profit.toFixed(1)}% profit)`);
+  if (wouldPayCombined <= CONFIG.MAX_COMBINED) {
+    // Acceptable to complete (profit or small loss < 0.5%)
+    const profitPct = (1 - wouldPayCombined) * 100;
+    if (profitPct > 0) {
+      console.log(`   ✅ Completing pair (${profitPct.toFixed(2)}% profit)`);
+    } else {
+      console.log(`   ⚠️ Completing pair (${Math.abs(profitPct).toFixed(2)}% loss - acceptable)`);
+    }
     
     await cancelAllOrders();
     const success = await marketBuy(otherTokenId, filledShares, otherAsk.price + 0.01);
@@ -241,26 +251,45 @@ async function handleOneSidedFill(filledSide: 'UP' | 'DOWN', filledPrice: number
     if (success) {
       // Wait for fill
       await new Promise(r => setTimeout(r, 2000));
+      await cancelAllOrders(); // Cancel any remaining orders
+      await new Promise(r => setTimeout(r, 1000));
       
       const upPos = await getPosition(state.upTokenId);
       const downPos = await getPosition(state.downTokenId);
       
-      if (upPos > 0 && downPos > 0 && upPos === downPos) {
-        const actualProfit = (1 - wouldPayCombined) * upPos;
-        console.log(`   ✅✅ COMPLETE! ${upPos} shares each`);
-        console.log(`   💰 Locked profit: $${actualProfit.toFixed(2)} (${profit.toFixed(1)}%)`);
+      console.log(`   📊 Positions: ${upPos} UP, ${downPos} DOWN`);
+      
+      if (upPos > 0 && downPos > 0 && Math.abs(upPos - downPos) <= 1) {
+        const minShares = Math.min(upPos, downPos);
+        const actualProfit = (1 - wouldPayCombined) * minShares;
+        console.log(`   ✅✅ COMPLETE! ${minShares} shares each`);
+        if (actualProfit > 0) {
+          console.log(`   💰 Locked profit: $${actualProfit.toFixed(2)} (${profitPct.toFixed(2)}%)`);
+        } else {
+          console.log(`   💰 Small loss: $${Math.abs(actualProfit).toFixed(2)} (${Math.abs(profitPct).toFixed(2)}%)`);
+        }
         
         stats.aggressiveCompletes++;
-        stats.totalProfit += actualProfit;
+        if (actualProfit > 0) {
+          stats.totalProfit += actualProfit;
+        } else {
+          stats.totalLoss += Math.abs(actualProfit);
+        }
         state.status = 'COMPLETE';
         state.tradesCompleted++;
         state.totalPnL += actualProfit;
+      } else {
+        console.log(`   ⚠️ Positions don't match - may need cleanup`);
+        state.status = 'IDLE';
       }
+    } else {
+      console.log(`   ❌ Failed to buy ${otherSide} - cutting loss`);
+      await cutLoss(filledSide, filledShares);
     }
   } else {
-    // Would lose money - cut loss
+    // Would lose too much (>0.5%) - cut loss
     const wouldLose = (wouldPayCombined - 1) * 100;
-    console.log(`   ❌ Would lose ${wouldLose.toFixed(1)}% - cutting loss`);
+    console.log(`   ❌ Would lose ${wouldLose.toFixed(2)}% - cutting loss`);
     await cutLoss(filledSide, filledShares);
   }
 }
@@ -275,24 +304,59 @@ async function cutLoss(side: 'UP' | 'DOWN', shares: number): Promise<void> {
   await cancelAllOrders();
   await new Promise(r => setTimeout(r, 1000)); // Wait for settlement
   
-  const success = await marketSell(tokenId, shares);
+  // Get current position before selling
+  const initialPos = await getPosition(tokenId);
+  console.log(`   📊 Current position: ${initialPos} shares`);
   
-  if (success) {
-    await new Promise(r => setTimeout(r, 1500));
-    
-    const remaining = await getPosition(tokenId);
-    if (remaining === 0) {
-      console.log(`   ✅ Loss cut - position closed`);
+  // Try selling multiple times if needed
+  for (let attempt = 1; attempt <= CONFIG.CUT_LOSS_MAX_ATTEMPTS; attempt++) {
+    const currentPos = await getPosition(tokenId);
+    if (currentPos === 0) {
+      console.log(`   ✅ Position already closed`);
       stats.cutLosses++;
-      stats.totalLoss += shares * 0.02; // Estimate ~2% spread cost
       state.status = 'IDLE';
-      state.totalPnL -= shares * 0.02;
       state.tradesCut++;
-    } else {
-      console.log(`   ⚠️ ${remaining} shares remaining`);
-      state.status = 'BLOCKED';
+      return;
+    }
+    
+    const sharesToSell = Math.min(currentPos, shares);
+    console.log(`   📤 Attempt ${attempt}/${CONFIG.CUT_LOSS_MAX_ATTEMPTS}: Selling ${sharesToSell} shares`);
+    
+    const success = await marketSell(tokenId, sharesToSell);
+    
+    if (success) {
+      // Wait for fill and check
+      await new Promise(r => setTimeout(r, 2000));
+      await cancelAllOrders(); // Cancel any remaining orders
+      await new Promise(r => setTimeout(r, 1000));
+      
+      const remaining = await getPosition(tokenId);
+      console.log(`   📊 Position after sell: ${remaining} shares`);
+      
+      if (remaining === 0) {
+        const loss = initialPos * 0.02; // Estimate ~2% spread cost
+        console.log(`   ✅ Loss cut - position closed (estimated loss: $${loss.toFixed(2)})`);
+        stats.cutLosses++;
+        stats.totalLoss += loss;
+        state.status = 'IDLE';
+        state.totalPnL -= loss;
+        state.tradesCut++;
+        return;
+      }
+    }
+    
+    // Wait before retry
+    if (attempt < CONFIG.CUT_LOSS_MAX_ATTEMPTS) {
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
+  
+  // Failed to close position after all attempts
+  const finalPos = await getPosition(tokenId);
+  console.log(`   ❌ Failed to close position - ${finalPos} shares remaining`);
+  console.log(`   ⚠️ Bot will continue but position is stuck`);
+  state.status = 'IDLE'; // Don't block, just continue
+  state.tradesCut++;
 }
 
 async function updateQuotes(): Promise<void> {
@@ -359,6 +423,11 @@ async function checkFills(): Promise<void> {
   
   const upPos = await getPosition(state.upTokenId);
   const downPos = await getPosition(state.downTokenId);
+  
+  // Log positions for debugging
+  if (upPos > 0 || downPos > 0) {
+    console.log(`   📊 Positions: ${upPos} UP, ${downPos} DOWN`);
+  }
   
   // Both sides filled
   if (upPos >= CONFIG.SHARES_PER_ORDER && downPos >= CONFIG.SHARES_PER_ORDER) {
@@ -453,6 +522,13 @@ export async function startMarketMaker(
         state.upPosition = 0;
         state.downPosition = 0;
         await new Promise(r => setTimeout(r, 2000));
+      }
+      
+      // Handle one-sided states (should be handled by handleOneSidedFill, but check anyway)
+      if (state.status === 'ONE_SIDED_UP' || state.status === 'ONE_SIDED_DOWN') {
+        // Already handled, just wait a bit
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
       }
       
       // Update quotes
