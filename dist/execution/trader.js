@@ -219,19 +219,12 @@ export async function executeTrade(arb) {
             return trade;
         }
     }
-    console.log(`\n   ⚡ MARKET ORDERS: ${MIN_SHARES} shares`);
-    // STEP 1: Market buy DOWN
-    const downResult = await marketBuy(arb.down_token_id, MIN_SHARES, arb.down_price, 'DOWN');
-    if (downResult.filled === 0) {
-        console.log(`   ⚠️ No DOWN fills - retrying...`);
-        trade.error = 'No DOWN fills';
-        trade.can_retry = true;
-        executedTrades.push(trade);
-        return trade;
-    }
-    // STEP 2: Market buy EXACT same UP
-    console.log(`   📊 Got ${downResult.filled} DOWN → buying ${downResult.filled} UP`);
-    const upResult = await marketBuy(arb.up_token_id, downResult.filled, arb.up_price, 'UP');
+    console.log(`\n   ⚡ PARALLEL MARKET ORDERS: ${MIN_SHARES} shares BOTH sides`);
+    // Buy BOTH at the SAME TIME - FAK orders execute instantly
+    const [downResult, upResult] = await Promise.all([
+        marketBuy(arb.down_token_id, MIN_SHARES, arb.down_price, 'DOWN'),
+        marketBuy(arb.up_token_id, MIN_SHARES, arb.up_price, 'UP')
+    ]);
     // FINAL CHECK
     const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
     const totalTime = Date.now() - startTime;
