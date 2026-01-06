@@ -21,8 +21,8 @@ import {
 
 const MIN_SHARES = 5;
 const POLL_INTERVAL_MS = 500;  // Fast polling
-const MAX_WAIT_MS = 3000;      // Max wait for fills
-const SETTLE_WAIT_MS = 500;    // Brief settlement wait
+const MAX_WAIT_MS = 4000;      // Max wait for fills
+const SETTLE_WAIT_MS = 2000;   // MUST wait for blockchain to update positions
 
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
@@ -344,12 +344,29 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
   const fillResult = await waitForBothPositions(arb.up_token_id, arb.down_token_id, MIN_SHARES);
   
   await cancelAllOrders();
-  await new Promise(r => setTimeout(r, SETTLE_WAIT_MS));
   
-  const finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
+  // CRITICAL: Wait for blockchain to update, then poll MULTIPLE times
+  // The blockchain position can lag behind actual fills
+  console.log(`   ⏳ Waiting for blockchain settlement...`);
+  
+  let finalPos = { up: 0, down: 0 };
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await new Promise(r => setTimeout(r, SETTLE_WAIT_MS));
+    finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
+    
+    // If we see ANY position, we know fills happened
+    if (finalPos.up > 0 || finalPos.down > 0) {
+      console.log(`   📊 Positions detected (attempt ${attempt}): ${finalPos.up} UP, ${finalPos.down} DOWN`);
+      break;
+    }
+    
+    if (attempt < 4) {
+      console.log(`   📊 Attempt ${attempt}: 0 UP, 0 DOWN - waiting more...`);
+    }
+  }
+  
   const totalTime = Date.now() - startTime;
-  
-  console.log(`\n   📊 RESULT: ${finalPos.up} UP, ${finalPos.down} DOWN (${totalTime}ms)`);
+  console.log(`\n   📊 FINAL: ${finalPos.up} UP, ${finalPos.down} DOWN (${totalTime}ms)`);
 
   // SUCCESS
   if (finalPos.up === finalPos.down && finalPos.up >= MIN_SHARES) {
@@ -364,9 +381,9 @@ export async function executeTrade(arb: ArbitrageOpportunity): Promise<ExecutedT
     return trade;
   }
   
-  // NOTHING
+  // NOTHING after multiple checks - truly nothing filled
   if (finalPos.up === 0 && finalPos.down === 0) {
-    console.log(`   ⚠️ No fills - can retry`);
+    console.log(`   ⚠️ No fills after ${4} checks - can retry`);
     trade.error = 'No fills';
     trade.can_retry = true;
     executedTrades.push(trade);
