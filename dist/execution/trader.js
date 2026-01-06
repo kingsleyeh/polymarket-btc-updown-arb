@@ -331,64 +331,16 @@ async function checkPositions(upTokenId, downTokenId, expectedShares) {
     }
 }
 /**
- * Sell/close a position immediately (reverse the filled leg)
+ * NOTE: Automatic reversal doesn't work on Polymarket!
+ * Tokens need to settle before they can be sold.
+ * Instead, we just report the exposure and block the market.
+ * User must manually sell on polymarket.com
  */
-async function reversePosition(tokenId, shares) {
-    if (!clobClient)
-        return false;
-    // Retry up to 3 times
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            // Get current price to sell at market
-            const priceResp = await axios.get(`${CLOB_HOST}/price`, {
-                params: { token_id: tokenId, side: 'sell' },
-                timeout: API_TIMEOUT_MS,
-            });
-            const sellPrice = parseFloat(priceResp.data?.price || '0');
-            if (sellPrice === 0) {
-                if (attempt < 3)
-                    continue;
-                return false;
-            }
-            // Use VERY aggressive limit (5% below market) to ensure immediate fill
-            const limitPrice = Math.max(sellPrice * 0.95, 0.01); // 5% below market for speed
-            if (attempt === 1) {
-                console.log(`   🔄 Reversing: selling ${shares} shares @ $${limitPrice.toFixed(3)} (attempt ${attempt})...`);
-            }
-            const order = await clobClient.createAndPostOrder({
-                tokenID: tokenId,
-                price: limitPrice,
-                size: shares,
-                side: Side.SELL,
-            });
-            if (order.orderID) {
-                console.log(`   ✓ Reversal order placed: ${order.orderID}`);
-                // Wait briefly and verify it filled
-                await new Promise(r => setTimeout(r, 200)); // 200ms to let order process
-                const orderStatus = await checkOrderStatus(order.orderID);
-                if (orderStatus === 'filled') {
-                    return true;
-                }
-                else if (attempt < 3) {
-                    console.log(`   ⚠️ Reversal order not filled yet, retrying...`);
-                    continue;
-                }
-                return true; // Order placed, even if not confirmed filled
-            }
-            if (attempt < 3)
-                continue;
-            return false;
-        }
-        catch (error) {
-            if (attempt < 3) {
-                console.log(`   ⚠️ Reversal attempt ${attempt} failed: ${error.message}, retrying...`);
-                continue;
-            }
-            console.error(`   ❌ Failed to reverse position after ${attempt} attempts: ${error.message}`);
-            return false;
-        }
-    }
-    return false;
+function reportExposure(side, shares) {
+    console.log(`   🚨 ONE-SIDED EXPOSURE: ${shares} ${side} shares`);
+    console.log(`   ⚠️  Polymarket tokens need time to settle before selling`);
+    console.log(`   👉 MANUAL ACTION: Go to polymarket.com and sell your ${side} position`);
+    console.log(`   ⛔ Market BLOCKED to prevent further exposure`);
 }
 /**
  * BOTH OR NOTHING: Wait for both orders, check positions continuously
@@ -483,43 +435,29 @@ async function waitForBothOrders(upOrderId, downOrderId, upTokenId, downTokenId,
         ]);
         return { upFilled: true, downFilled: true, secondLegOrderId, reversed: false };
     }
-    // ONE-SIDED OR NONE - REVERSE IMMEDIATELY
-    console.log(`   ❌ Don't have both - reversing any filled leg...`);
+    // ONE-SIDED OR NONE - Cancel unfilled orders
+    console.log(`   ❌ Don't have both - cancelling unfilled orders...`);
     await Promise.all([
         cancelOrder(upOrderId),
         cancelOrder(downOrderId),
         secondLegOrderId ? cancelOrder(secondLegOrderId) : Promise.resolve(),
     ]);
-    // Reverse any filled leg - use ACTUAL balance from positions (not expected shares)
+    // Check what we ended up with
     let reversed = false;
-    let hadPositionToReverse = false;
     if (finalHasUp && !finalHasDown) {
-        hadPositionToReverse = true;
-        // Only reverse what we actually have, not what we expected
-        const sharesToReverse = Math.floor(finalPositions.upBalance);
-        if (sharesToReverse >= 1) {
-            console.log(`   🔄 Reversing ${sharesToReverse} UP shares...`);
-            reversed = await reversePosition(upTokenId, sharesToReverse);
-        }
+        // ONE-SIDED: Have UP but no DOWN
+        reportExposure('UP', Math.floor(finalPositions.upBalance));
+        reversed = false; // Can't auto-reverse, user must handle
     }
     else if (!finalHasUp && finalHasDown) {
-        hadPositionToReverse = true;
-        const sharesToReverse = Math.floor(finalPositions.downBalance);
-        if (sharesToReverse >= 1) {
-            console.log(`   🔄 Reversing ${sharesToReverse} DOWN shares...`);
-            reversed = await reversePosition(downTokenId, sharesToReverse);
-        }
+        // ONE-SIDED: Have DOWN but no UP
+        reportExposure('DOWN', Math.floor(finalPositions.downBalance));
+        reversed = false; // Can't auto-reverse, user must handle
     }
     else if (!finalHasUp && !finalHasDown) {
-        // No positions - orders never filled, this is actually a success (no exposure)
-        console.log(`   ✓ No positions to reverse - orders didn't fill (safe)`);
-        reversed = true; // Mark as "reversed" since we have no exposure
-    }
-    if (reversed && hadPositionToReverse) {
-        console.log(`   ✅ Reversal successful - position cleared`);
-    }
-    else if (!reversed && hadPositionToReverse) {
-        console.log(`   ❌ REVERSAL FAILED - MANUAL INTERVENTION NEEDED`);
+        // SAFE: Neither filled - no exposure
+        console.log(`   ✓ No positions - orders didn't fill (safe to retry)`);
+        reversed = true; // No exposure = safe
     }
     return { upFilled: false, downFilled: false, secondLegOrderId, reversed };
 }
@@ -680,36 +618,19 @@ export async function executeTrade(arb) {
             executedTrades.push(trade);
             return trade;
         }
-        // DANGER: One-sided position - need to verify reversal worked
+        // DANGER: One-sided position - cannot auto-reverse on Polymarket
         if (hasOneSided) {
-            console.log(`   🚨 One-sided position: UP=${finalCheck.upBalance.toFixed(1)} DOWN=${finalCheck.downBalance.toFixed(1)}`);
-            // waitForBothOrders should have already tried to reverse
-            // But we still have a position, so reversal failed OR it's still pending
-            // Try ONE more time
-            console.log(`   🔄 Attempting final reversal...`);
-            let finalReversed = false;
-            if (finalCheck.hasUp && !finalCheck.hasDown) {
-                finalReversed = await reversePosition(arb.up_token_id, Math.floor(finalCheck.upBalance));
-            }
-            else {
-                finalReversed = await reversePosition(arb.down_token_id, Math.floor(finalCheck.downBalance));
-            }
-            // Check positions again after reversal attempt
-            const afterReversal = await checkPositions(arb.up_token_id, arb.down_token_id, shares);
-            const stillHasExposure = (afterReversal.hasUp && !afterReversal.hasDown) || (!afterReversal.hasUp && afterReversal.hasDown);
             trade.status = 'failed';
-            trade.reversal_succeeded = finalReversed && !stillHasExposure;
-            trade.has_exposure = stillHasExposure;
-            if (stillHasExposure) {
-                trade.error = 'REVERSAL FAILED - Manual intervention needed';
-                console.log(`   ❌ REVERSAL FAILED - Unhedged: UP=${afterReversal.upBalance.toFixed(1)} DOWN=${afterReversal.downBalance.toFixed(1)}`);
-                console.log(`   🚨 MANUAL INTERVENTION NEEDED!`);
+            trade.reversal_succeeded = false;
+            trade.has_exposure = true; // We have unhedged exposure
+            if (finalCheck.hasUp && !finalCheck.hasDown) {
+                trade.error = `ONE-SIDED: ${finalCheck.upBalance.toFixed(0)} UP shares - sell manually on polymarket.com`;
+                reportExposure('UP', Math.floor(finalCheck.upBalance));
             }
             else {
-                trade.error = 'One-sided position reversed successfully';
-                console.log(`   ✅ Position cleared - can retry if arb persists`);
+                trade.error = `ONE-SIDED: ${finalCheck.downBalance.toFixed(0)} DOWN shares - sell manually on polymarket.com`;
+                reportExposure('DOWN', Math.floor(finalCheck.downBalance));
             }
-            console.log(`   📊 Continuing to scan...\n`);
             executedTrades.push(trade);
             return trade;
         }
