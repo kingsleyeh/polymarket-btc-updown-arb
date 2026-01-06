@@ -12,8 +12,8 @@ import { ethers } from 'ethers';
 import { connectOrderBookWebSocket, subscribeToTokens, disconnectOrderBookWebSocket } from './orderbook-ws';
 const MIN_SHARES = 5;
 const POLL_INTERVAL_MS = 500; // Fast polling
-const MAX_WAIT_MS = 4000; // Max wait for fills
-const SETTLE_WAIT_MS = 2000; // MUST wait for blockchain to update positions
+const MAX_WAIT_MS = 3000; // Max wait for fills
+const SETTLE_WAIT_MS = 1000; // Wait for blockchain to update positions
 const CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
 let clobClient = null;
@@ -115,15 +115,19 @@ async function getBothPositions(upTokenId, downTokenId) {
 }
 async function cancelAllOrders() {
     if (!clobClient)
-        return;
+        return 0;
     try {
         const openOrders = await clobClient.getOpenOrders();
         if (openOrders && openOrders.length > 0) {
             console.log(`   🧹 Cancelling ${openOrders.length} orders...`);
             await clobClient.cancelAll();
+            return openOrders.length;
         }
+        return 0;
     }
-    catch { }
+    catch {
+        return 0;
+    }
 }
 /**
  * Place a LIMIT order at specified price
@@ -273,22 +277,24 @@ export async function executeTrade(arb) {
     }
     console.log(`   ✓ Orders placed, polling...`);
     // STEP 3: FAST POLLING FOR FILLS
-    const fillResult = await waitForBothPositions(arb.up_token_id, arb.down_token_id, MIN_SHARES);
-    await cancelAllOrders();
-    // CRITICAL: Wait for blockchain to update, then poll MULTIPLE times
-    // The blockchain position can lag behind actual fills
-    console.log(`   ⏳ Waiting for blockchain settlement...`);
+    await waitForBothPositions(arb.up_token_id, arb.down_token_id, MIN_SHARES);
+    // Cancel remaining orders - count tells us how many DIDN'T fill
+    const cancelledCount = await cancelAllOrders();
+    const expectedFills = 2 - cancelledCount; // 2 orders placed
+    console.log(`   📊 ${cancelledCount} cancelled → ${expectedFills} likely filled`);
+    // Wait for blockchain, poll until we see expected fills or timeout
     let finalPos = { up: 0, down: 0 };
-    for (let attempt = 1; attempt <= 4; attempt++) {
+    const maxAttempts = expectedFills > 0 ? 3 : 1; // Only poll if we expect fills
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise(r => setTimeout(r, SETTLE_WAIT_MS));
         finalPos = await getBothPositions(arb.up_token_id, arb.down_token_id);
-        // If we see ANY position, we know fills happened
-        if (finalPos.up > 0 || finalPos.down > 0) {
-            console.log(`   📊 Positions detected (attempt ${attempt}): ${finalPos.up} UP, ${finalPos.down} DOWN`);
+        const totalFilled = (finalPos.up > 0 ? 1 : 0) + (finalPos.down > 0 ? 1 : 0);
+        // Exit if we see the expected fills OR any position
+        if (totalFilled >= expectedFills || (finalPos.up > 0 || finalPos.down > 0)) {
             break;
         }
-        if (attempt < 4) {
-            console.log(`   📊 Attempt ${attempt}: 0 UP, 0 DOWN - waiting more...`);
+        if (attempt < maxAttempts) {
+            console.log(`   ⏳ Waiting for positions... (attempt ${attempt})`);
         }
     }
     const totalTime = Date.now() - startTime;
